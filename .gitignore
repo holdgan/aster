@@ -1,0 +1,73 @@
+# Cryptocurrency Data Collection System
+# Focused .gitignore for py_data project
+
+# Sensitive Files
+*.env
+*.secret
+config.py
+sftp-config.json
+secrets.json
+api_keys.txt
+
+# Database Files
+*.db
+*.sqlite*
+database.sql
+*backup*.sql
+
+# Private Keys & Certificates
+*.pem
+*.key
+*.crt
+id_rsa*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+env/
+ENV/
+
+# Logs
+logs/
+*.log
+*.log.*
+nohup.out
+
+# Cache & Temp
+cache/
+.cache/
+temp/
+tmp/
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# OS Files
+.DS_Store
+Thumbs.db
+*~
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project Specific
+# Data exports and reports
+exports/
+reports/
+data_dumps/
+cmc_api_dump_*.json
+
+# Test files
+test_data/
+playground.*
+scratch.*
+debug_*.py
+
+# Archive files (usually temporary)
+*.zip
+*.tar.gz
