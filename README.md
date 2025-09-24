@@ -39,3 +39,4 @@ deactivate
 **Simplified Design**: .env configuration → Direct API calls → Trading logic
 
 No databases, no Redis, no complex abstractions. Just clean, maintainable code.
+# aster
