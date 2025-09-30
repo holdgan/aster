@@ -3,6 +3,7 @@
 Aster BTCUSDT Executor Server (B/C服务器通用脚本)
 接收协调器信号，执行maker订单，维护本地风控
 """
+from collections import deque
 
 import asyncio
 import json
@@ -117,6 +118,7 @@ class ExecutorBot:
         self.order_count_last_minute = 0
         self.last_minute_timestamp = time.time()
         self.background_tasks = None  # 后台任务引用
+        self.recent_fills: deque[Dict[str, Any]] = deque(maxlen=50)
 
         # 风控状态
         self.emergency_stop = False
@@ -167,6 +169,7 @@ class ExecutorBot:
         self.app.router.add_get('/health', self._handle_health)
         self.app.router.add_get('/status', self._handle_status)
         self.app.router.add_post('/emergency_stop', self._handle_emergency_stop)
+        self.app.router.add_get('/stats', self._handle_stats)
         self.app.router.add_get('/position', self._handle_position)
 
     async def start(self):
@@ -252,8 +255,9 @@ class ExecutorBot:
             except (TypeError, ValueError):
                 price_val = 0.0
 
+            side_emoji = "🔵" if 'buy' in action.lower() else "🔴"
             logger.info(
-                f"📥 Received signal: {action} {self._format_quantity(quantity_val)} @ {self._format_price(price_val)}"
+                f"{side_emoji} Signal: {action} {self._format_quantity(quantity_val)} @ {self._format_price(price_val)}"
             )
 
             # 验证信号
@@ -392,7 +396,7 @@ class ExecutorBot:
             result = await self.account_state.client.place_order(order_params)
 
             if result and 'orderId' in result:
-                logger.info(f"✅ Buy maker order placed: {quantity:.6f} @ ${price:.2f} (Order ID: {result['orderId']})")
+                logger.debug(f"✅ Buy maker: {quantity:.6f} @ ${price:.2f} (ID: {result['orderId']})")
                 return {
                     'success': True,
                     'orderId': result['orderId'],
@@ -427,7 +431,7 @@ class ExecutorBot:
             result = await self.account_state.client.place_order(order_params)
 
             if result and 'orderId' in result:
-                logger.info(f"✅ Sell maker order placed: {quantity:.6f} @ ${price:.2f} (Order ID: {result['orderId']})")
+                logger.debug(f"✅ Sell maker: {quantity:.6f} @ ${price:.2f} (ID: {result['orderId']})")
                 return {
                     'success': True,
                     'orderId': result['orderId'],
@@ -527,9 +531,19 @@ class ExecutorBot:
                 # 检查活跃订单状态
                 for order_id, order_info in self.active_orders.items():
                     try:
-                        # 检查订单是否过期
-                        if current_time - order_info['timestamp'] > self.config.order_expire_seconds:
-                            logger.info(f"⏰ Canceling expired order: {order_id}")
+                        order_age = current_time - order_info['timestamp']
+
+                        # 激进策略：挂单超过12秒立即取消（刷量冷却时间）
+                        aggressive_timeout = 12.0
+                        if order_age > aggressive_timeout:
+                            logger.warning(f"⚠️ Order {order_id} stuck for {order_age:.1f}s, canceling aggressively")
+                            await self._cancel_order(order_id)
+                            orders_to_remove.append(order_id)
+                            continue
+
+                        # 正常过期检查（保留兜底）
+                        if order_age > self.config.order_expire_seconds:
+                            logger.debug(f"⏰ Canceling expired order: {order_id}")
                             await self._cancel_order(order_id)
                             orders_to_remove.append(order_id)
                             continue
@@ -543,7 +557,25 @@ class ExecutorBot:
                                 if status == 'FILLED':
                                     filled_qty = float(order_status.get('executedQty', 0))
                                     filled_price = float(order_status.get('avgPrice', order_info['price']))
-                                    logger.info(f"✅ Order filled: {order_id} - {filled_qty:.6f} @ ${filled_price:.2f}")
+                                    side_emoji = "🔵" if order_info.get('side') == 'BUY' else "🔴"
+                                    # Calculate current fill rate
+                                    recent_60s = [e for e in self.recent_fills if current_time - e['timestamp'] <= 60]
+                                    if recent_60s:
+                                        current_fill_rate = sum(1 for e in recent_60s if e['filled']) / len(recent_60s)
+                                    else:
+                                        current_fill_rate = 0.5
+                                    logger.info(f"{side_emoji} Filled {filled_qty:.6f} @ ${filled_price:.2f} | FillRate: {current_fill_rate*100:.0f}%")
+                                    self.recent_fills.append({
+                                        'order_id': order_id,
+                                        'timestamp': current_time,
+                                        'filled': True
+                                    })
+                                else:
+                                    self.recent_fills.append({
+                                        'order_id': order_id,
+                                        'timestamp': current_time,
+                                        'filled': False
+                                    })
                                 orders_to_remove.append(order_id)
 
                     except Exception as e:
@@ -564,7 +596,12 @@ class ExecutorBot:
         try:
             result = await self.account_state.client.cancel_order(SYMBOL, order_id)
             if result:
-                logger.info(f"✅ Order canceled: {order_id}")
+                logger.debug(f"✅ Order canceled: {order_id}")
+                self.recent_fills.append({
+                    'order_id': order_id,
+                    'timestamp': time.time(),
+                    'filled': False
+                })
             else:
                 logger.warning(f"⚠️ Cancel order failed: {order_id}")
         except Exception as e:
@@ -675,6 +712,55 @@ class ExecutorBot:
             })
         except Exception as e:
             return web.json_response({'error': str(e)}, status=500)
+
+    async def _handle_stats(self, request):
+        """返回近期订单统计（包含挂单惩罚）"""
+        current_time = time.time()
+        window = float(request.query.get('window', 60.0))
+
+        # 历史订单统计
+        recent = [entry for entry in self.recent_fills if current_time - entry['timestamp'] <= window]
+
+        # 当前挂单统计 - 关键修复！
+        pending_orders = []
+        max_pending_duration = 0.0
+        pending_timeout = 15.0  # 15秒未成交视为"待失败"
+
+        for order_id, order_info in self.active_orders.items():
+            age = current_time - order_info['timestamp']
+            pending_orders.append({
+                'order_id': order_id,
+                'age': age
+            })
+            max_pending_duration = max(max_pending_duration, age)
+
+        # 计算实际成交率：历史成交 / (历史总数 + 超时挂单数)
+        if not recent and not pending_orders:
+            fill_rate = 0.5
+        else:
+            filled_count = sum(1 for entry in recent if entry['filled'])
+            total_evaluated = len(recent)
+
+            # 挂单超过15秒的，视为"即将失败"，计入分母
+            pending_failures = sum(1 for order in pending_orders if order['age'] > pending_timeout)
+            total_evaluated += pending_failures
+
+            if total_evaluated > 0:
+                fill_rate = filled_count / total_evaluated
+            else:
+                fill_rate = 0.5
+
+        return web.json_response({
+            'server': self.server_name,
+            'window_seconds': window,
+            'total_orders': len(recent),
+            'filled_orders': sum(1 for entry in recent if entry['filled']),
+            'pending_orders': len(pending_orders),
+            'pending_timeout_count': sum(1 for o in pending_orders if o['age'] > pending_timeout),
+            'max_pending_duration': max_pending_duration,
+            'fill_rate': fill_rate,
+            'timestamp': current_time
+        })
 
     async def _handle_emergency_stop(self, request):
         """紧急停止端点"""
