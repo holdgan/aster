@@ -1,2 +1,8 @@
+# Aster Trading System - Python Dependencies
+
+# Core dependencies from original bot
 aiohttp>=3.8.0
 python-dotenv>=1.0.0
+
+# Additional dependencies for distributed system
+# (Note: keeping minimal dependencies as per Linus philosophy)
