@@ -162,6 +162,7 @@ class ExecutorBot:
         self.app.router.add_post('/emergency_stop', self._handle_emergency_stop)
         self.app.router.add_get('/stats', self._handle_stats)
         self.app.router.add_get('/position', self._handle_position)
+        self.app.router.add_get('/order_history', self._handle_order_history)
 
     async def start(self):
         """启动执行器服务器"""
@@ -333,16 +334,17 @@ class ExecutorBot:
             action = signal['action']
             price = float(signal['price'])
             quantity = float(signal['quantity'])
+            client_order_id = signal.get('client_order_id', None)  # Get custom client_order_id
 
             # 执行订单
             if action == 'buy_maker':
-                order_result = await self._place_buy_maker_order(price, quantity)
+                order_result = await self._place_buy_maker_order(price, quantity, client_order_id)
             elif action == 'sell_maker':
-                order_result = await self._place_sell_maker_order(price, quantity)
+                order_result = await self._place_sell_maker_order(price, quantity, client_order_id)
             elif action == 'buy_taker':
-                order_result = await self._place_buy_taker_order(quantity)
+                order_result = await self._place_buy_taker_order(quantity, client_order_id)
             else:  # sell_taker
-                order_result = await self._place_sell_taker_order(quantity)
+                order_result = await self._place_sell_taker_order(quantity, client_order_id)
 
             if order_result['success']:
                 self.order_count_last_minute += 1
@@ -366,7 +368,7 @@ class ExecutorBot:
             logger.error(f"❌ Error processing signal: {e}")
             return {'success': False, 'reason': str(e)}
 
-    async def _place_buy_maker_order(self, price: float, quantity: float) -> Dict:
+    async def _place_buy_maker_order(self, price: float, quantity: float, client_order_id: str = None) -> Dict:
         """下买单maker订单"""
         try:
             # 使用symbol_spec进行精度取整
@@ -381,6 +383,10 @@ class ExecutorBot:
                 'price': f"{rounded_price:.{self.symbol_spec.price_precision}f}",
                 'timeInForce': 'GTX'  # GTX确保只做maker
             }
+
+            # Add client_order_id if provided
+            if client_order_id:
+                order_params['newClientOrderId'] = client_order_id
 
             result = await self.account_state.client.place_order(order_params)
 
@@ -401,7 +407,7 @@ class ExecutorBot:
             logger.error(f"❌ Buy maker order error: {e}")
             return {'success': False, 'reason': str(e)}
 
-    async def _place_sell_maker_order(self, price: float, quantity: float) -> Dict:
+    async def _place_sell_maker_order(self, price: float, quantity: float, client_order_id: str = None) -> Dict:
         """下卖单maker订单"""
         try:
             # 使用symbol_spec进行精度取整
@@ -416,6 +422,10 @@ class ExecutorBot:
                 'price': f"{rounded_price:.{self.symbol_spec.price_precision}f}",
                 'timeInForce': 'GTX'  # GTX确保只做maker
             }
+
+            # Add client_order_id if provided
+            if client_order_id:
+                order_params['newClientOrderId'] = client_order_id
 
             result = await self.account_state.client.place_order(order_params)
 
@@ -436,7 +446,7 @@ class ExecutorBot:
             logger.error(f"❌ Sell maker order error: {e}")
             return {'success': False, 'reason': str(e)}
 
-    async def _place_buy_taker_order(self, quantity: float) -> Dict:
+    async def _place_buy_taker_order(self, quantity: float, client_order_id: str = None) -> Dict:
         """下买单taker订单"""
         try:
             rounded_qty = self.symbol_spec.round_qty(quantity)
@@ -446,6 +456,10 @@ class ExecutorBot:
                 'type': 'MARKET',
                 'quantity': f"{rounded_qty:.{self.symbol_spec.qty_precision}f}"
             }
+
+            # Add client_order_id if provided
+            if client_order_id:
+                order_params['newClientOrderId'] = client_order_id
 
             result = await self.account_state.client.place_order(order_params)
 
@@ -466,7 +480,7 @@ class ExecutorBot:
             logger.error(f"❌ Buy taker order error: {e}")
             return {'success': False, 'reason': str(e)}
 
-    async def _place_sell_taker_order(self, quantity: float) -> Dict:
+    async def _place_sell_taker_order(self, quantity: float, client_order_id: str = None) -> Dict:
         """下卖单taker订单"""
         try:
             rounded_qty = self.symbol_spec.round_qty(quantity)
@@ -476,6 +490,10 @@ class ExecutorBot:
                 'type': 'MARKET',
                 'quantity': f"{rounded_qty:.{self.symbol_spec.qty_precision}f}"
             }
+
+            # Add client_order_id if provided
+            if client_order_id:
+                order_params['newClientOrderId'] = client_order_id
 
             result = await self.account_state.client.place_order(order_params)
 
@@ -769,6 +787,70 @@ class ExecutorBot:
             'fill_rate': fill_rate,
             'timestamp': current_time
         })
+
+    async def _handle_order_history(self, request):
+        """返回订单历史详情（用于统计）"""
+        try:
+            hours = float(request.query.get('hours', 2.0))
+            strategy = request.query.get('strategy', None)  # 'cycle' or 'server' or None
+
+            import time
+            start_time = int((time.time() - hours * 3600) * 1000)
+
+            # Query orders from exchange using direct API call
+            # AsterFuturesClient may not have get_all_orders wrapper
+            params = {
+                'symbol': SYMBOL,
+                'startTime': start_time
+            }
+            orders = await self.account_state.client._signed_request('GET', '/fapi/v1/allOrders', params)
+
+            # Filter by strategy if specified
+            filtered_orders = []
+            debug_sample = []  # For debugging: collect sample client_order_ids
+
+            for order in orders:
+                client_order_id = order.get('clientOrderId', '')
+
+                # Collect first 5 for debugging
+                if len(debug_sample) < 5:
+                    debug_sample.append(client_order_id)
+
+                # Filter by strategy prefix
+                if strategy == 'cycle':
+                    if not client_order_id.startswith(f'cycle_{self.account_id}_'):
+                        continue
+                elif strategy == 'server':
+                    if not client_order_id.startswith(f'server_{self.account_id}_'):
+                        continue
+                else:
+                    # All strategies: accept if it has our account_id in it
+                    # More lenient: just check if it's likely from our system
+                    if not client_order_id or client_order_id == '':
+                        continue  # Skip empty client_order_ids
+                    # Accept all non-empty client_order_ids if no strategy filter
+                    pass
+
+                filtered_orders.append(order)
+
+            logger.info(f"Order history query: total={len(orders)}, filtered={len(filtered_orders)}, sample_ids={debug_sample}")
+
+            return web.json_response({
+                'server': self.server_name,
+                'account_id': self.account_id,
+                'hours': hours,
+                'strategy_filter': strategy,
+                'total_orders': len(orders),
+                'filtered_orders': len(filtered_orders),
+                'orders': filtered_orders
+            })
+
+        except Exception as e:
+            logger.error(f"Failed to get order history: {e}")
+            return web.json_response(
+                {'error': str(e)},
+                status=500
+            )
 
     async def _handle_emergency_stop(self, request):
         """紧急停止端点"""

@@ -364,6 +364,12 @@ class InventoryCycler:
     async def _send_signal(self, decision: Dict[str, object]) -> None:
         server = decision["server"]  # type: ignore[index]
         url = self.server_urls[server]
+
+        # Generate client_order_id for tracking
+        action = decision["action"]  # type: ignore[index]
+        timestamp = int(time.time() * 1000)
+        client_order_id = f"cycle_{server}_{action}_{timestamp}"
+
         signal_payload = {
             "timestamp": time.time(),  # Use wall-clock time for signal validation
             "action": decision["action"],
@@ -373,6 +379,7 @@ class InventoryCycler:
             "expire_time": decision["expire_time"],
             "source": "coordinator-cycle",
             "reason": decision["reason"],
+            "client_order_id": client_order_id,
         }
         try:
             timeout = ClientTimeout(total=self.config.signal_timeout)
@@ -426,10 +433,13 @@ class InventoryCycler:
             return None
 
     def _calculate_maker_price(self, market: Dict[str, float], side: str) -> float:
+        """Calculate maker order price
+
+        买单：挂在当前买1价格（bid_price）
+        卖单：挂在当前卖1价格（ask_price）
+        """
         price = market["bid_price"] if side == "BUY" else market["ask_price"]
-        offset = 0.5  # 0.5 USDT away from top of book
-        adjusted = price - offset if side == "BUY" else price + offset
-        return self.account_state.symbol_spec.round_price(adjusted)
+        return self.account_state.symbol_spec.round_price(price)
 
 
 async def main() -> None:
