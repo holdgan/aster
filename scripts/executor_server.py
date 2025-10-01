@@ -46,6 +46,10 @@ logger = get_logger("executor")
 DEFAULT_MAX_ORDER_USD = os.getenv('MAX_ORDER_USD')
 DEFAULT_MAX_ORDER_USD = float(DEFAULT_MAX_ORDER_USD) if DEFAULT_MAX_ORDER_USD else None
 
+# 读取订单超时配置
+DEFAULT_ORDER_EXPIRY = float(os.getenv('ORDER_EXPIRY_TIME', '30.0'))
+DEFAULT_PENDING_FAILURE = float(os.getenv('PENDING_FAILURE_SECONDS', '20.0'))
+
 @dataclass
 class ExecutorConfig:
     """执行器配置"""
@@ -57,16 +61,8 @@ class ExecutorConfig:
     max_position_usd: Optional[float] = None  # 仅用于监控日志，不阻断执行
     max_order_usd: Optional[float] = field(default_factory=lambda: DEFAULT_MAX_ORDER_USD)
     max_orders_per_minute: int = 30
-    emergency_stop_loss_percent: float = 5.0
-
-    # 订单管理
-    order_expire_seconds: float = 30.0
-    cancel_timeout_seconds: float = 5.0
-    price_deviation_tolerance: float = 0.002  # 0.2%
-
-    # 积分优化
-    preferred_fill_ratio: float = 0.6  # 期望60%的订单成交
-    repost_interval_seconds: float = 8.0
+    order_expire_seconds: float = field(default_factory=lambda: DEFAULT_ORDER_EXPIRY)
+    pending_failure_seconds: float = field(default_factory=lambda: DEFAULT_PENDING_FAILURE)
 
 class ExecutorBot:
     """执行器机器人 - 接收信号执行maker订单"""
@@ -368,7 +364,8 @@ class ExecutorBot:
                         'price': price,
                         'quantity': quantity,
                         'timestamp': time.time(),
-                        'signal': signal
+                        'signal': signal,
+                        'outcome_recorded': False
                     }
 
             return order_result
@@ -529,15 +526,20 @@ class ExecutorBot:
                 orders_to_remove = []
 
                 # 检查活跃订单状态
-                for order_id, order_info in self.active_orders.items():
+                for order_id, order_info in list(self.active_orders.items()):
                     try:
                         order_age = current_time - order_info['timestamp']
 
-                        # 激进策略：挂单超过12秒立即取消（刷量冷却时间）
-                        aggressive_timeout = 12.0
-                        if order_age > aggressive_timeout:
-                            logger.warning(f"⚠️ Order {order_id} stuck for {order_age:.1f}s, canceling aggressively")
-                            await self._cancel_order(order_id)
+                        # 超过失败阈值直接标记失败并撤单
+                        if order_age > self.config.pending_failure_seconds:
+                            logger.warning(
+                                "⚠️ Order %s stuck %.1fs (>%.1fs), marking as failed",
+                                order_id,
+                                order_age,
+                                self.config.pending_failure_seconds
+                            )
+                            self._mark_order_outcome(order_id, filled=False)
+                            await self._cancel_order(order_id, record_failure=False)
                             orders_to_remove.append(order_id)
                             continue
 
@@ -565,17 +567,9 @@ class ExecutorBot:
                                     else:
                                         current_fill_rate = 0.5
                                     logger.info(f"{side_emoji} Filled {filled_qty:.6f} @ ${filled_price:.2f} | FillRate: {current_fill_rate*100:.0f}%")
-                                    self.recent_fills.append({
-                                        'order_id': order_id,
-                                        'timestamp': current_time,
-                                        'filled': True
-                                    })
+                                    self._mark_order_outcome(order_id, filled=True)
                                 else:
-                                    self.recent_fills.append({
-                                        'order_id': order_id,
-                                        'timestamp': current_time,
-                                        'filled': False
-                                    })
+                                    self._mark_order_outcome(order_id, filled=False)
                                 orders_to_remove.append(order_id)
 
                     except Exception as e:
@@ -583,7 +577,8 @@ class ExecutorBot:
 
                 # 清理完成的订单
                 for order_id in orders_to_remove:
-                    self.active_orders.pop(order_id, None)
+                    if order_id in self.active_orders:
+                        self.active_orders.pop(order_id, None)
 
                 await asyncio.sleep(2.0)
 
@@ -591,21 +586,37 @@ class ExecutorBot:
                 logger.error(f"❌ Order management loop error: {e}")
                 await asyncio.sleep(5.0)
 
-    async def _cancel_order(self, order_id: str):
+    def _mark_order_outcome(self, order_id: str, filled: bool):
+        """记录订单结果，避免重复写入"""
+        order_info = self.active_orders.get(order_id)
+        if order_info and order_info.get('outcome_recorded'):
+            return
+
+        if order_info is not None:
+            order_info['outcome_recorded'] = True
+
+        self.recent_fills.append({
+            'order_id': order_id,
+            'timestamp': time.time(),
+            'filled': filled
+        })
+
+    async def _cancel_order(self, order_id: str, record_failure: bool = True):
         """取消订单"""
         try:
             result = await self.account_state.client.cancel_order(SYMBOL, order_id)
             if result:
                 logger.debug(f"✅ Order canceled: {order_id}")
-                self.recent_fills.append({
-                    'order_id': order_id,
-                    'timestamp': time.time(),
-                    'filled': False
-                })
+                if record_failure:
+                    self._mark_order_outcome(order_id, filled=False)
             else:
                 logger.warning(f"⚠️ Cancel order failed: {order_id}")
+                if record_failure:
+                    self._mark_order_outcome(order_id, filled=False)
         except Exception as e:
             logger.error(f"❌ Cancel order error: {e}")
+            if record_failure:
+                self._mark_order_outcome(order_id, filled=False)
 
     async def _risk_monitoring_loop(self):
         """风控监控循环"""
@@ -724,7 +735,7 @@ class ExecutorBot:
         # 当前挂单统计 - 关键修复！
         pending_orders = []
         max_pending_duration = 0.0
-        pending_timeout = 15.0  # 15秒未成交视为"待失败"
+        pending_timeout = self.config.pending_failure_seconds
 
         for order_id, order_info in self.active_orders.items():
             age = current_time - order_info['timestamp']
@@ -750,14 +761,19 @@ class ExecutorBot:
             else:
                 fill_rate = 0.5
 
+        pending_count = len(pending_orders)
+        max_pending_age = max_pending_duration
+
         return web.json_response({
             'server': self.server_name,
             'window_seconds': window,
             'total_orders': len(recent),
             'filled_orders': sum(1 for entry in recent if entry['filled']),
-            'pending_orders': len(pending_orders),
+            'pending_orders': pending_count,
             'pending_timeout_count': sum(1 for o in pending_orders if o['age'] > pending_timeout),
             'max_pending_duration': max_pending_duration,
+            'pending_count': pending_count,
+            'max_pending_age': max_pending_age,
             'fill_rate': fill_rate,
             'timestamp': current_time
         })

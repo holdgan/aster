@@ -12,7 +12,7 @@ import os
 import signal
 import sys
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from collections import deque
@@ -30,6 +30,9 @@ from aster_btcusdt_genesis import (
 
 # 常量
 SYMBOL = "BTCUSDT"
+MAX_LEVERAGE = 10.0
+SAFETY_MARGIN = 0.95
+MIN_ORDER_QTY_BTC = 0.001
 
 load_dotenv()
 logger = get_logger("coordinator")
@@ -46,48 +49,44 @@ except ImportError as e:
 @dataclass
 class SystemConfig:
     """系统配置 - 统一管理所有配置参数"""
-    # 仓位限制
-    max_position_a: float = 3000.0
-    max_position_b: float = 4000.0
-    max_position_c: float = 4000.0
+    max_position_b: float = 6000.0
+    max_position_c: float = 6000.0
     max_order_usd: float = 500.0
-
-    # 净敞口控制
-    max_net_exposure: float = 100.0
-    net_exposure_tolerance: float = 50.0
-    emergency_threshold: float = 200.0
-
-    # 订单配置
-    order_size_usd: float = 150.0
-    max_order_btc: float = 0.1
+    order_size_usd: float = 226.0
+    order_quantity_btc: float = 0.002  # 新增：直接指定BTC数量
+    max_order_btc: float = 0.005
     volume_cooldown: float = 12.0
-
-    # 风险管理
-    daily_loss_limit: float = 500.0
-    max_account_position_diff: float = 300.0
-
-    # 积分优化
-    target_maker_ratio: float = 0.8
-    optimize_for_points: bool = True
+    target_position_btc_b: float = 0.0
+    target_position_btc_c: float = 0.0
+    target_position_threshold_btc: float = 0.01
+    limit_fallback_count: int = 3
+    pending_count_threshold: int = 3  # 从2改为3
+    pending_age_threshold_seconds: float = 12.0  # 从8改为12
+    # 增仓策略配置
+    increase_position_usage_threshold: float = 0.7  # 仓位使用率低于此值时优先增仓
+    net_exposure_soft_limit: float = 50.0  # 净敞口软限制（触发方向调整）
+    net_exposure_hard_limit: float = 200.0  # 净敞口硬限制（强制平衡）
 
     @classmethod
     def from_env(cls) -> 'SystemConfig':
         """从环境变量安全加载配置"""
         return cls(
-            max_position_a=cls._get_float('MAX_POSITION_A_USD', 3000.0),
-            max_position_b=cls._get_float('MAX_POSITION_B_USD', 4000.0),
-            max_position_c=cls._get_float('MAX_POSITION_C_USD', 4000.0),
+            max_position_b=cls._get_float('MAX_POSITION_B_USD', 6000.0),
+            max_position_c=cls._get_float('MAX_POSITION_C_USD', 6000.0),
             max_order_usd=cls._get_float('MAX_ORDER_USD', 500.0),
-            max_net_exposure=cls._get_float('MAX_NET_EXPOSURE_USD', 100.0),
-            net_exposure_tolerance=cls._get_float('NET_EXPOSURE_TOLERANCE', 50.0),
-            emergency_threshold=cls._get_float('EMERGENCY_BALANCE_THRESHOLD', 200.0),
-            order_size_usd=cls._get_float('COORDINATOR_ORDER_SIZE_USD', 150.0),
-            max_order_btc=cls._get_float('COORDINATOR_MAX_ORDER_BTC', 0.1),
+            order_size_usd=cls._get_float('COORDINATOR_ORDER_SIZE_USD', 226.0),
+            order_quantity_btc=cls._get_float('COORDINATOR_ORDER_QUANTITY_BTC', 0.002),
+            max_order_btc=cls._get_float('COORDINATOR_MAX_ORDER_BTC', 0.005),
             volume_cooldown=cls._get_float('VOLUME_COOLDOWN_SECONDS', 12.0),
-            daily_loss_limit=cls._get_float('DAILY_LOSS_LIMIT', 500.0),
-            max_account_position_diff=cls._get_float('MAX_ACCOUNT_POSITION_DIFF', 300.0),
-            target_maker_ratio=cls._get_float('TARGET_MAKER_RATIO', 0.8),
-            optimize_for_points=os.getenv('OPTIMIZE_FOR_POINTS', 'true').lower() == 'true',
+            target_position_btc_b=cls._get_float('TARGET_POSITION_BTC_B', 0.0),
+            target_position_btc_c=cls._get_float('TARGET_POSITION_BTC_C', 0.0),
+            target_position_threshold_btc=cls._get_float('TARGET_POSITION_THRESHOLD_BTC', 0.01),
+            limit_fallback_count=int(float(os.getenv('LIMIT_FALLBACK_COUNT', '3'))),
+            pending_count_threshold=int(float(os.getenv('PENDING_COUNT_THRESHOLD', '3'))),
+            pending_age_threshold_seconds=cls._get_float('PENDING_AGE_THRESHOLD_SECONDS', 12.0),
+            increase_position_usage_threshold=cls._get_float('INCREASE_POSITION_USAGE_THRESHOLD', 0.7),
+            net_exposure_soft_limit=cls._get_float('NET_EXPOSURE_SOFT_LIMIT', 50.0),
+            net_exposure_hard_limit=cls._get_float('NET_EXPOSURE_HARD_LIMIT', 200.0),
         )
 
     @staticmethod
@@ -109,16 +108,79 @@ class SystemConfig:
             logger.error("❌ Position limits must be positive")
             return False
 
-        if self.max_net_exposure > min(self.max_position_b, self.max_position_c):
-            logger.warning(
-                f"⚠️ Net exposure limit ({self.max_net_exposure}) larger than "
-                f"min account limit ({min(self.max_position_b, self.max_position_c)})"
-            )
-
         if self.volume_cooldown <= 0:
             logger.error("❌ Volume cooldown must be positive")
             return False
 
+        if self.limit_fallback_count < 0:
+            logger.warning("⚠️ limit_fallback_count negative, reset to 0")
+            self.limit_fallback_count = 0
+
+        minimum_threshold = max(MIN_ORDER_QTY_BTC, 0.01)
+        if self.target_position_threshold_btc < minimum_threshold:
+            logger.warning(
+                "⚠️ target_position_threshold_btc %.4f too small, bumping to %.4f BTC",
+                self.target_position_threshold_btc,
+                minimum_threshold
+            )
+            self.target_position_threshold_btc = minimum_threshold
+
+        if self.max_order_btc < MIN_ORDER_QTY_BTC:
+            logger.warning(
+                "⚠️ max_order_btc %.4f too small, bumping to %.4f BTC",
+                self.max_order_btc,
+                MIN_ORDER_QTY_BTC
+            )
+            self.max_order_btc = MIN_ORDER_QTY_BTC
+
+        if self.pending_age_threshold_seconds <= 0:
+            logger.warning("⚠️ pending_age_threshold_seconds must be positive, fallback to 8s")
+            self.pending_age_threshold_seconds = 8.0
+
+        if self.pending_count_threshold < 0:
+            logger.warning("⚠️ pending_count_threshold negative, reset to 0")
+            self.pending_count_threshold = 0
+
+        # 校验新增字段: order_quantity_btc
+        if self.order_quantity_btc < MIN_ORDER_QTY_BTC:
+            logger.error(
+                f"❌ order_quantity_btc {self.order_quantity_btc:.4f} < minimum {MIN_ORDER_QTY_BTC}"
+            )
+            return False
+
+        if self.order_quantity_btc > self.max_order_btc:
+            logger.error(
+                f"❌ order_quantity_btc {self.order_quantity_btc:.4f} > max_order_btc {self.max_order_btc:.4f}"
+            )
+            return False
+
+        # 校验新增字段: increase_position_usage_threshold
+        if not (0 < self.increase_position_usage_threshold <= 1.0):
+            logger.error(
+                f"❌ increase_position_usage_threshold {self.increase_position_usage_threshold:.2f} "
+                f"must be in (0, 1]"
+            )
+            return False
+
+        # 校验净敞口阈值关系
+        if self.net_exposure_soft_limit >= self.net_exposure_hard_limit:
+            logger.error(
+                f"❌ net_exposure_soft_limit {self.net_exposure_soft_limit:.0f} "
+                f"must < hard_limit {self.net_exposure_hard_limit:.0f}"
+            )
+            return False
+
+        if self.net_exposure_hard_limit <= 0:
+            logger.error(
+                f"❌ net_exposure_hard_limit {self.net_exposure_hard_limit:.0f} must > 0"
+            )
+            return False
+
+        logger.info(
+            f"✅ Config validated: order_qty={self.order_quantity_btc:.4f} BTC, "
+            f"usage_threshold={self.increase_position_usage_threshold:.0%}, "
+            f"net_exposure soft={self.net_exposure_soft_limit:.0f}/hard={self.net_exposure_hard_limit:.0f}"
+        )
         return True
 
 # 加载系统配置
@@ -128,9 +190,13 @@ if not SYSTEM_CONFIG.validate():
     sys.exit(1)
 
 logger.info(
-    f"✅ Config loaded: A={SYSTEM_CONFIG.max_position_a}, "
-    f"B={SYSTEM_CONFIG.max_position_b}, C={SYSTEM_CONFIG.max_position_c}, "
-    f"cooldown={SYSTEM_CONFIG.volume_cooldown}s"
+    "✅ Config loaded | max_position B=%.0f C=%.0f | order_size %.0f | cooldown %.1fs | pending threshold=%d/%.1fs",
+    SYSTEM_CONFIG.max_position_b,
+    SYSTEM_CONFIG.max_position_c,
+    SYSTEM_CONFIG.order_size_usd,
+    SYSTEM_CONFIG.volume_cooldown,
+    SYSTEM_CONFIG.pending_count_threshold,
+    SYSTEM_CONFIG.pending_age_threshold_seconds
 )
 
 @dataclass
@@ -155,10 +221,6 @@ class CoordinatorConfig:
     max_total_exposure_usd: float = 5000.0
     emergency_exposure_threshold: float = 8000.0
     per_server_max_notional: float = 1000.0
-
-    # 积分优化参数
-    preferred_maker_ratio: float = 0.8  # 80%使用maker，20%使用taker
-    volume_target_per_hour: float = 50000.0  # 每小时目标交易量
 
     # 决策间隔
     decision_interval: float = 2.0
@@ -218,18 +280,31 @@ class CoordinatorBot:
         self.last_market_price = 0.0
         self.running = True
         self.tasks = []  # 任务列表
-        self.executor_exposures: Dict[str, float] = {'A': 0.0, 'B': 0.0, 'C': 0.0}
+        self.executor_exposures: Dict[str, float] = {'B': 0.0, 'C': 0.0}
         self.position_limits: Dict[str, float] = {
-            'A': SYSTEM_CONFIG.max_position_a,
             'B': SYSTEM_CONFIG.max_position_b,
             'C': SYSTEM_CONFIG.max_position_c
         }
+        self.target_positions_btc: Dict[str, float] = {
+            'B': SYSTEM_CONFIG.target_position_btc_b,
+            'C': SYSTEM_CONFIG.target_position_btc_c
+        }
+        self.target_threshold_btc = SYSTEM_CONFIG.target_position_threshold_btc
         self.order_history: Dict[str, deque] = {
             'B': deque(maxlen=50),
             'C': deque(maxlen=50)
         }
         self.executor_fill_rates: Dict[str, float] = {'B': 0.5, 'C': 0.5}
+        self.executor_pending_orders: Dict[str, int] = {'B': 0, 'C': 0}
+        self.executor_pending_max_age: Dict[str, float] = {'B': 0.0, 'C': 0.0}
+        self.executor_stats_blocked: Dict[str, bool] = {'B': False, 'C': False}
+        self.limit_violation_rounds: Dict[str, int] = {'B': 0, 'C': 0}
         self.last_stats_fetch = 0.0
+        self.executor_positions_btc: Dict[str, float] = {'B': 0.0, 'C': 0.0}
+        self.summary_metrics = {
+            'B': {'fill_sum': 0.0, 'fill_count': 0, 'pending_max': 0.0},
+            'C': {'fill_sum': 0.0, 'fill_count': 0, 'pending_max': 0.0}
+        }
 
         # 积分跟踪
         self.session_volume = 0.0
@@ -241,8 +316,12 @@ class CoordinatorBot:
         self.stats_volume_generated = 0.0
         self.last_summary_time = time.time()
 
-        # 超限纠偏失败计数（用于taker fallback）
-        self.limit_violation_rounds: Dict[str, int] = {'B': 0, 'C': 0}
+        # 刷量轮换（防止B和C同时刷量）
+        self.last_volume_sender = 'C'  # 初始为C，这样B先发
+
+        # Emergency控制
+        self.emergency_trigger_count = 0  # 连续触发计数
+        self.last_emergency_time = 0.0
 
     def _normalize_price(self, price: float) -> float:
         """按照交易对精度规范化价格，避免浮点尾数"""
@@ -263,10 +342,23 @@ class CoordinatorBot:
         spread = max(ask - bid, self.symbol_spec.tick_size)
         if server:
             multiplier = self._calculate_adaptive_multiplier(server, aggressive)
+            fill_rate = self._get_recent_fill_rate(server)
         else:
             multiplier = 0.03 if aggressive else 0.1
+            fill_rate = 0.5
+
         offset = max(self.symbol_spec.tick_size, spread * multiplier)
-        offset *= random.uniform(0.8, 1.2)
+
+        # 根据成交率调整随机扰动：成交率低时更激进（只向内扰动）
+        if fill_rate < 0.2:
+            # 成交率很低：只向内扰动 (0.5-0.9)
+            offset *= random.uniform(0.5, 0.9)
+        elif fill_rate < 0.5:
+            # 成交率中等：适度向内扰动 (0.6-1.0)
+            offset *= random.uniform(0.6, 1.0)
+        else:
+            # 成交率正常：正常扰动 (0.6-1.4)
+            offset *= random.uniform(0.6, 1.4)
 
         if side == 'SELL':
             raw_price = ask + offset
@@ -278,7 +370,7 @@ class CoordinatorBot:
     def _calculate_optimal_order_size(self, server: str, exposure_usd: float, spread_bps: float) -> float:
         """根据 spread 和剩余额度计算刷量单大小 (USD)"""
         raw_limit = self.position_limits.get(server, 0.0)
-        safe_limit = raw_limit * 0.9 if raw_limit else 0.0
+        safe_limit = raw_limit * SAFETY_MARGIN if raw_limit else 0.0
         remaining = max(safe_limit - abs(exposure_usd), 0.0)
 
         # 降低刷量订单大小，避免过度震荡
@@ -291,150 +383,359 @@ class CoordinatorBot:
 
         # 限制最多用剩余额度的30%（从50%降低）
         max_safe_size = remaining * 0.3 if remaining > 0 else 0.0
+        leverage_cap = (safe_limit / MAX_LEVERAGE) if safe_limit > 0 else base_size
+        if leverage_cap > 0:
+            max_safe_size = min(max_safe_size, leverage_cap)
 
         if max_safe_size <= 0:
             return 0.0
 
         return max(self.symbol_spec.min_notional, min(base_size, max_safe_size))
 
-    def _append_volume_decisions(self, decisions: List[Dict], market_data: Dict, exposures: Dict[str, float]):
+    def _simulate_exposure_change(self, exposures_usd: Dict[str, float], exposures_btc: Dict[str, float], server: str,
+                                  action: str, price: float, quantity: float):
+        """根据指令预估敞口变化，供后续决策使用"""
+        notional = quantity * price
+        if action in ('buy_maker', 'buy_taker'):
+            exposures_usd[server] = exposures_usd.get(server, 0.0) + notional
+            exposures_btc[server] = exposures_btc.get(server, 0.0) + quantity
+        elif action in ('sell_maker', 'sell_taker'):
+            exposures_usd[server] = exposures_usd.get(server, 0.0) - notional
+            exposures_btc[server] = exposures_btc.get(server, 0.0) - quantity
+
+    def _ensure_target_inventory(self, decisions: List[Dict], market_data: Dict,
+                                 exposures_usd: Dict[str, float], exposures_btc: Dict[str, float]):
+        mid_price = market_data['mid_price']
+        for server in ('B', 'C'):
+            pending_count = self.executor_pending_orders.get(server, 0)
+            max_pending_age = self.executor_pending_max_age.get(server, 0.0)
+            count_threshold = SYSTEM_CONFIG.pending_count_threshold
+            age_threshold = SYSTEM_CONFIG.pending_age_threshold_seconds
+            pending_block = count_threshold > 0 and pending_count >= count_threshold
+            age_block = age_threshold > 0 and max_pending_age >= age_threshold
+            if self.executor_stats_blocked.get(server) or pending_block or age_block:
+                logger.debug(
+                    "%s target adjust skipped due to pending backlog (count=%d, age=%.1fs)",
+                    server,
+                    pending_count,
+                    max_pending_age
+                )
+                continue
+
+            target = self.target_positions_btc.get(server, 0.0)
+            current = exposures_btc.get(server, 0.0)
+            diff = current - target
+            if abs(diff) < self.target_threshold_btc:
+                continue
+
+            raw_limit = self.position_limits.get(server, 0.0)
+            safe_limit = raw_limit * SAFETY_MARGIN if raw_limit else 0.0
+
+            side = 'SELL' if diff > 0 else 'BUY'
+            # 限制单次调整量：最多调整1/3的偏差，避免过度震荡
+            max_adjust_qty = abs(diff) * 0.33
+            desired_qty = min(max_adjust_qty, SYSTEM_CONFIG.max_order_btc, safe_limit / mid_price * 0.3)
+            quantity = self._normalize_quantity(desired_qty)
+            if quantity < MIN_ORDER_QTY_BTC:
+                quantity = self._normalize_quantity(MIN_ORDER_QTY_BTC)
+            if quantity <= 0:
+                continue
+
+            price = self._calculate_maker_price(market_data, side, aggressive=True, server=server)
+            notional = quantity * price
+            new_exposure_usd = exposures_usd.get(server, 0.0) - notional if side == 'SELL' else exposures_usd.get(server, 0.0) + notional
+            if safe_limit and abs(new_exposure_usd) > safe_limit:
+                continue
+
+            decisions.append({
+                'server': server,
+                'action': 'sell_maker' if side == 'SELL' else 'buy_maker',
+                'price': price,
+                'quantity': quantity,
+                'expire_time': time.time() + 30.0,
+                'reason': f'Target inventory adjust to {target:.4f} BTC'
+            })
+            self._simulate_exposure_change(exposures_usd, exposures_btc, server,
+                                           'sell_maker' if side == 'SELL' else 'buy_maker',
+                                           price, quantity)
+
+    def _append_emergency_net_exposure_correction(
+        self,
+        decisions: List[Dict],
+        market_data: Dict,
+        exposures_usd: Dict[str, float],
+        exposures_btc: Dict[str, float],
+        total_net_exposure: float
+    ):
+        """
+        紧急净敞口纠偏（最高优先级，但要避免过度发单）
+
+        选择与净敞口同号且abs最小的账户执行反向订单，避免单边负担。
+        新增限制：如果目标账户已有pending订单，暂缓发单，等待成交。
+        连续触发3次后切换taker确保成交。
+        """
+        mid_price = market_data['mid_price']
+
+        # 确定需要的操作方向
+        if total_net_exposure > 0:
+            side = 'SELL'
+            direction_desc = "short"
+            # 找与净敞口同号(正值)且abs最小的账户
+            candidates = {k: v for k, v in exposures_usd.items() if v >= 0}
+        else:
+            side = 'BUY'
+            direction_desc = "long"
+            # 找与净敞口同号(负值)且abs最小的账户
+            candidates = {k: v for k, v in exposures_usd.items() if v <= 0}
+
+        # 如果没有同号账户（极端情况），fallback到abs最小
+        if not candidates:
+            logger.warning("⚠️ No same-sign candidate, falling back to min abs(exposure)")
+            target_server = min(exposures_usd.items(), key=lambda x: abs(x[1]))[0]
+        else:
+            # 选同号中abs最小的
+            target_server = min(candidates.items(), key=lambda x: abs(x[1]))[0]
+
+        # 检查目标账户的pending状态，避免过度发单
+        pending_count = self.executor_pending_orders.get(target_server, 0)
+        max_pending_age = self.executor_pending_max_age.get(target_server, 0.0)
+
+        # 如果目标账户已有pending订单，暂缓发单（等待现有订单成交）
+        if pending_count > 0:
+            logger.warning(
+                f"🚨 Emergency correction delayed: {target_server} has {pending_count} pending orders "
+                f"(age={max_pending_age:.1f}s), waiting for settlement before new order"
+            )
+            return  # 不发新单，等待现有订单成交
+
+        # 更新连续触发计数
+        current_time = time.time()
+        if current_time - self.last_emergency_time > 30.0:
+            # 超过30秒没触发，重置计数
+            self.emergency_trigger_count = 0
+        self.emergency_trigger_count += 1
+        self.last_emergency_time = current_time
+
+        # 连续触发3次后切换taker确保成交
+        use_taker = self.emergency_trigger_count >= 3
+
+        if use_taker:
+            # Taker模式：使用市价单
+            action = f'{side.lower()}_taker'
+            price = mid_price
+            logger.warning(
+                f"⚠️ Emergency triggered {self.emergency_trigger_count} times, switching to TAKER"
+            )
+        else:
+            # Maker模式：使用最激进定价
+            action = f'{side.lower()}_maker'
+            price = self._calculate_maker_price(market_data, side, aggressive=True, server=target_server)
+
+        quantity = SYSTEM_CONFIG.order_quantity_btc
+
+        decision = {
+            'server': target_server,
+            'action': action,
+            'price': price,
+            'quantity': quantity,
+            'expire_time': time.time() + 60.0,
+            'reason': f'🚨 EMERGENCY net exposure balance: ${total_net_exposure:.0f} -> {direction_desc}'
+        }
+
+        decisions.append(decision)
+
+        # 模拟更新exposures，避免后续逻辑使用旧数据
+        self._simulate_exposure_change(exposures_usd, exposures_btc, target_server, action, price, quantity)
+
+        logger.warning(
+            f"🚨 Emergency ({self.emergency_trigger_count}x): {target_server} {side} {quantity:.4f} BTC "
+            f"@ ${price:.1f} ({'TAKER' if use_taker else 'MAKER'}) to balance net ${total_net_exposure:.0f}"
+        )
+
+    def _append_volume_decisions(
+        self,
+        decisions: List[Dict],
+        market_data: Dict,
+        exposures_usd: Dict[str, float],
+        exposures_btc: Dict[str, float]
+    ):
         current_time = time.time()
         spread_bps = market_data['spread_bps']
         mid_price = market_data['mid_price']
-        jitter = 0.3
-        cooldown_b = SYSTEM_CONFIG.volume_cooldown * random.uniform(1 - jitter, 1 + jitter)
-        cooldown_c = SYSTEM_CONFIG.volume_cooldown * random.uniform(1 - jitter, 1 + jitter)
+        cooldown_b = random.uniform(6.0, 18.0)
+        cooldown_c = random.uniform(6.0, 18.0)
+        target_threshold = self.target_threshold_btc
 
         # B 刷量（方向自适应）
         time_since_last_b = current_time - self.last_signal_time.get('B', 0)
         if time_since_last_b > cooldown_b and not any(d.get('server') == 'B' for d in decisions):
-            exposure_b = exposures.get('B', 0.0)
-            limit_b = self.position_limits.get('B', 0.0)
-            if limit_b > 0:
-                remaining_b = limit_b * 0.9 - abs(exposure_b)
-                if remaining_b < 200.0:
-                    logger.debug(f"B remaining {remaining_b:.2f} too low, skipping volume trade")
+            if self.executor_stats_blocked.get('B'):
+                logger.debug("B pending watchdog active, skip volume")
+            else:
+                exposure_b = exposures_usd.get('B', 0.0)
+                position_b = exposures_btc.get('B', 0.0)
+                target_b = self.target_positions_btc.get('B', 0.0)
+                delta_b = position_b - target_b
+                if abs(delta_b) > target_threshold:
+                    logger.debug(
+                        "B target drift %.4f outside threshold %.4f, skip volume",
+                        delta_b,
+                        target_threshold
+                    )
                 else:
-                    order_size_usd = self._calculate_optimal_order_size('B', exposure_b, spread_bps)
-                    if order_size_usd > 0:
-                        # 检查是否已有其他刷量单（避免同时发单）
-                        has_volume_order = any('Volume generation' in d.get('reason', '') for d in decisions)
-                        if has_volume_order:
-                            logger.debug("B: Skipping volume trade, another server already sending")
+                    limit_b = self.position_limits.get('B', 0.0)
+                    if limit_b > 0:
+                        remaining_b = limit_b * SAFETY_MARGIN - abs(exposure_b)
+                        if remaining_b < 200.0:
+                            logger.debug(f"B remaining {remaining_b:.2f} too low, skipping volume trade")
                         else:
-                            order_size_usd *= random.uniform(0.8, 1.2)
-                            order_size_usd = max(self.symbol_spec.min_notional, order_size_usd)
-
-                            # 刷量方向：优先考虑净敞口平衡
-                            total_net_exposure = sum(exposures.values())
-
-                            # 如果净敞口过大，刷量订单应该帮助平衡
-                            if abs(total_net_exposure) > 200.0:
-                                # 净敞口为正（多头过多） → 刷空单
-                                # 净敞口为负（空头过多） → 刷多单
-                                side = 'SELL' if total_net_exposure > 0 else 'BUY'
-                                reason_suffix = f"balance net ${total_net_exposure:.0f}"
-                            else:
-                                # 净敞口正常，按个人仓位反向刷量
-                                side_default = 'SELL' if exposure_b > 0 else 'BUY'
-                                if self._should_reverse_direction('B', exposure_b, limit_b):
-                                    side = 'BUY' if side_default == 'SELL' else 'SELL'
-                                    reason_suffix = "reverse direction"
+                            order_size_usd = self._calculate_optimal_order_size('B', exposure_b, spread_bps)
+                            if order_size_usd > 0:
+                                # 轮换机制：只允许非上次发单账户刷量
+                                if self.last_volume_sender == 'B':
+                                    logger.debug("B: Skipping volume trade, last sender was B (rotation)")
                                 else:
-                                    side = side_default
-                                    reason_suffix = f"{'sell' if side == 'SELL' else 'buy'} side"
+                                    order_size_usd *= random.uniform(0.8, 1.2)
+                                    order_size_usd = max(self.symbol_spec.min_notional, order_size_usd)
 
-                            price = self._calculate_maker_price(market_data, side, aggressive=False, server='B')
-                            quantity = self._normalize_quantity(order_size_usd / mid_price)
-                            notional = quantity * price
-                            new_exposure = exposure_b - notional if side == 'SELL' else exposure_b + notional
+                                    usage = abs(exposure_b) / limit_b if limit_b > 0 else 0
 
-                            if self._within_position_limit('B', new_exposure):
-                                reason = f"Volume generation - {reason_suffix}"
-                                decisions.append({
-                                    'server': 'B',
-                                    'action': 'sell_maker' if side == 'SELL' else 'buy_maker',
-                                    'price': price,
-                                    'quantity': quantity,
-                                    'expire_time': current_time + 60.0,
-                                    'reason': reason
-                                })
-                            else:
-                                logger.debug(
-                                    "Skipping B volume trade due to limit: current %.2f, order %.2f, limit %.2f",
-                                    exposure_b,
-                                    notional,
-                                    limit_b * 0.9
-                                )
+                                    # 简化的静态互补策略: B=BUY，仓位使用率低于阈值时优先增仓
+                                    if usage < SYSTEM_CONFIG.increase_position_usage_threshold:
+                                        # 增仓模式：B固定做多
+                                        side = 'BUY'
+                                        reason_suffix = f"increase long (usage {usage*100:.0f}%)"
+                                    else:
+                                        # 保守模式：按当前仓位反向平衡
+                                        side_default = 'SELL' if exposure_b > 0 else 'BUY'
+                                        if self._should_reverse_direction('B', exposure_b, limit_b):
+                                            side = 'BUY' if side_default == 'SELL' else 'SELL'
+                                            reason_suffix = f"reverse (usage {usage*100:.0f}%)"
+                                        else:
+                                            side = side_default
+                                            reason_suffix = f"maintain (usage {usage*100:.0f}%)"
+
+                                    price = self._calculate_maker_price(market_data, side, aggressive=False, server='B')
+                                    # 直接使用配置的BTC数量，避免USD换算精度问题
+                                    quantity = SYSTEM_CONFIG.order_quantity_btc
+                                    notional = quantity * price
+                                    new_exposure = exposure_b - notional if side == 'SELL' else exposure_b + notional
+
+                                    if self._within_position_limit('B', new_exposure):
+                                        reason = f"Volume generation - {reason_suffix}"
+                                        decision = {
+                                            'server': 'B',
+                                            'action': 'sell_maker' if side == 'SELL' else 'buy_maker',
+                                            'price': price,
+                                            'quantity': quantity,
+                                            'expire_time': current_time + 60.0,
+                                            'reason': reason
+                                        }
+                                        decisions.append(decision)
+                                        self._simulate_exposure_change(
+                                            exposures_usd,
+                                            exposures_btc,
+                                            decision['server'],
+                                            decision['action'],
+                                            decision['price'],
+                                            decision['quantity']
+                                        )
+                                    else:
+                                        logger.debug(
+                                            "Skipping B volume trade due to limit: current %.2f, order %.2f, limit %.2f",
+                                            exposure_b,
+                                            notional,
+                                            limit_b * SAFETY_MARGIN
+                                        )
 
         # C 刷量（方向自适应）
         time_since_last_c = current_time - self.last_signal_time.get('C', 0)
         if time_since_last_c > cooldown_c and not any(d.get('server') == 'C' for d in decisions):
-            exposure_c = exposures.get('C', 0.0)
-            limit_c = self.position_limits.get('C', 0.0)
-            if limit_c > 0:
-                remaining_c = limit_c * 0.9 - abs(exposure_c)
-                if remaining_c < 200.0:
-                    logger.debug(f"C remaining {remaining_c:.2f} too low, skipping volume trade")
+            if self.executor_stats_blocked.get('C'):
+                logger.debug("C pending watchdog active, skip volume")
+            else:
+                exposure_c = exposures_usd.get('C', 0.0)
+                position_c = exposures_btc.get('C', 0.0)
+                target_c = self.target_positions_btc.get('C', 0.0)
+                delta_c = position_c - target_c
+                if abs(delta_c) > target_threshold:
+                    logger.debug(
+                        "C target drift %.4f outside threshold %.4f, skip volume",
+                        delta_c,
+                        target_threshold
+                    )
                 else:
-                    order_size_usd = self._calculate_optimal_order_size('C', exposure_c, spread_bps)
-                    if order_size_usd > 0:
-                        # 检查是否已有其他刷量单（避免同时发单）
-                        has_volume_order = any('Volume generation' in d.get('reason', '') for d in decisions)
-                        if has_volume_order:
-                            logger.debug("C: Skipping volume trade, another server already sending")
+                    limit_c = self.position_limits.get('C', 0.0)
+                    if limit_c > 0:
+                        remaining_c = limit_c * SAFETY_MARGIN - abs(exposure_c)
+                        if remaining_c < 200.0:
+                            logger.debug(f"C remaining {remaining_c:.2f} too low, skipping volume trade")
                         else:
-                            order_size_usd *= random.uniform(0.8, 1.2)
-                            order_size_usd = max(self.symbol_spec.min_notional, order_size_usd)
-
-                            # 刷量方向：优先考虑净敞口平衡
-                            total_net_exposure = sum(exposures.values())
-
-                            # 如果净敞口过大，刷量订单应该帮助平衡
-                            if abs(total_net_exposure) > 200.0:
-                                # 净敞口为正（多头过多） → 刷空单
-                                # 净敞口为负（空头过多） → 刷多单
-                                side = 'SELL' if total_net_exposure > 0 else 'BUY'
-                                reason_suffix = f"balance net ${total_net_exposure:.0f}"
-                            else:
-                                # 净敞口正常，按个人仓位反向刷量
-                                side_default = 'SELL' if exposure_c > 0 else 'BUY'
-                                if self._should_reverse_direction('C', exposure_c, limit_c):
-                                    side = 'BUY' if side_default == 'SELL' else 'SELL'
-                                    reason_suffix = "reverse direction"
+                            order_size_usd = self._calculate_optimal_order_size('C', exposure_c, spread_bps)
+                            if order_size_usd > 0:
+                                # 轮换机制：只允许非上次发单账户刷量
+                                if self.last_volume_sender == 'C':
+                                    logger.debug("C: Skipping volume trade, last sender was C (rotation)")
                                 else:
-                                    side = side_default
-                                    reason_suffix = f"{'sell' if side == 'SELL' else 'buy'} side"
+                                    order_size_usd *= random.uniform(0.8, 1.2)
+                                    order_size_usd = max(self.symbol_spec.min_notional, order_size_usd)
 
-                            price = self._calculate_maker_price(market_data, side, aggressive=False, server='C')
-                            quantity = self._normalize_quantity(order_size_usd / mid_price)
-                            notional = quantity * price
-                            new_exposure = exposure_c + notional if side == 'BUY' else exposure_c - notional
+                                    usage = abs(exposure_c) / limit_c if limit_c > 0 else 0
 
-                            if self._within_position_limit('C', new_exposure):
-                                reason = f"Volume generation - {reason_suffix}"
-                                decisions.append({
-                                    'server': 'C',
-                                    'action': 'buy_maker' if side == 'BUY' else 'sell_maker',
-                                    'price': price,
-                                    'quantity': quantity,
-                                    'expire_time': current_time + 60.0,
-                                    'reason': reason
-                                })
-                            else:
-                                logger.debug(
-                                    "Skipping C volume trade due to limit: current %.2f, order %.2f, limit %.2f",
-                                    exposure_c,
-                                    notional,
-                                    limit_c * 0.9
-                                )
+                                    # 简化的静态互补策略: C=SELL，仓位使用率低于阈值时优先增仓
+                                    if usage < SYSTEM_CONFIG.increase_position_usage_threshold:
+                                        # 增仓模式：C固定做空
+                                        side = 'SELL'
+                                        reason_suffix = f"increase short (usage {usage*100:.0f}%)"
+                                    else:
+                                        # 保守模式：按当前仓位反向平衡
+                                        side_default = 'SELL' if exposure_c > 0 else 'BUY'
+                                        if self._should_reverse_direction('C', exposure_c, limit_c):
+                                            side = 'BUY' if side_default == 'SELL' else 'SELL'
+                                            reason_suffix = f"reverse (usage {usage*100:.0f}%)"
+                                        else:
+                                            side = side_default
+                                            reason_suffix = f"maintain (usage {usage*100:.0f}%)"
+
+                                    price = self._calculate_maker_price(market_data, side, aggressive=False, server='C')
+                                    # 直接使用配置的BTC数量，避免USD换算精度问题
+                                    quantity = SYSTEM_CONFIG.order_quantity_btc
+                                    notional = quantity * price
+                                    new_exposure = exposure_c + notional if side == 'BUY' else exposure_c - notional
+
+                                    if self._within_position_limit('C', new_exposure):
+                                        reason = f"Volume generation - {reason_suffix}"
+                                        decision = {
+                                            'server': 'C',
+                                            'action': 'buy_maker' if side == 'BUY' else 'sell_maker',
+                                            'price': price,
+                                            'quantity': quantity,
+                                            'expire_time': current_time + 60.0,
+                                            'reason': reason
+                                        }
+                                        decisions.append(decision)
+                                        self._simulate_exposure_change(
+                                            exposures_usd,
+                                            exposures_btc,
+                                            decision['server'],
+                                            decision['action'],
+                                            decision['price'],
+                                            decision['quantity']
+                                        )
+                                    else:
+                                        logger.debug(
+                                            "Skipping C volume trade due to limit: current %.2f, order %.2f, limit %.2f",
+                                            exposure_c,
+                                            notional,
+                                            limit_c * SAFETY_MARGIN
+                                        )
 
     def _within_position_limit(self, server: str, new_exposure: float) -> bool:
         """检查新敞口是否在安全限制内（90%限制）"""
         raw_limit = self.position_limits.get(server)
         if raw_limit is None or raw_limit <= 0:
             return True
-        safe_limit = raw_limit * 0.9
+        safe_limit = raw_limit * SAFETY_MARGIN
         return abs(new_exposure) <= safe_limit
 
     def _record_order_result(self, server: str, filled: bool):
@@ -442,6 +743,14 @@ class CoordinatorBot:
         if history is None:
             return
         history.append({'timestamp': time.time(), 'filled': filled})
+
+    def _accumulate_summary_metrics(self, server: str, fill_rate: float, max_pending_age: float):
+        bucket = self.summary_metrics.get(server)
+        if bucket is None:
+            return
+        bucket['fill_sum'] += fill_rate
+        bucket['fill_count'] += 1
+        bucket['pending_max'] = max(bucket['pending_max'], max_pending_age)
 
     def _get_recent_fill_rate(self, server: str, window_seconds: float = 60.0) -> float:
         history = self.order_history.get(server)
@@ -465,11 +774,45 @@ class CoordinatorBot:
         self.last_stats_fetch = current_time
 
         for server in ('B', 'C'):
-            fill_rate = await self._fetch_executor_fill_rate(server)
-            if fill_rate is not None:
-                self.executor_fill_rates[server] = fill_rate
+            stats = await self._fetch_executor_stats(server)
+            if not stats:
+                continue
 
-    async def _fetch_executor_fill_rate(self, server: str) -> Optional[float]:
+            fill_rate = float(stats.get('fill_rate', self.executor_fill_rates.get(server, 0.5)))
+            pending_count = int(stats.get('pending_count', 0))
+            max_pending_age = float(stats.get('max_pending_age', 0.0))
+
+            prev_blocked = self.executor_stats_blocked.get(server, False)
+            count_threshold = SYSTEM_CONFIG.pending_count_threshold
+            age_threshold = SYSTEM_CONFIG.pending_age_threshold_seconds
+            pending_block = count_threshold > 0 and pending_count >= count_threshold
+            age_block = age_threshold > 0 and max_pending_age >= age_threshold
+            blocked = pending_block or age_block
+
+            if blocked:
+                if not prev_blocked:
+                    logger.warning(
+                        "⚠️ %s pending backlog detected: count=%d, max_age=%.1fs; suspending volume",
+                        server,
+                        pending_count,
+                        max_pending_age
+                    )
+                fill_rate = 0.0
+            elif prev_blocked and not blocked:
+                logger.info(
+                    "✅ %s pending cleared (count=%d, max_age=%.1fs); resuming volume",
+                    server,
+                    pending_count,
+                    max_pending_age
+                )
+
+            self.executor_stats_blocked[server] = blocked
+            self.executor_fill_rates[server] = fill_rate
+            self.executor_pending_orders[server] = pending_count
+            self.executor_pending_max_age[server] = max_pending_age
+            self._accumulate_summary_metrics(server, fill_rate, max_pending_age)
+
+    async def _fetch_executor_stats(self, server: str) -> Optional[Dict[str, float]]:
         server_config = self.server_b if server == 'B' else self.server_c
         if not server_config or not server_config.url:
             return None
@@ -481,32 +824,46 @@ class CoordinatorBot:
                     return None
                 data = await response.json()
                 fill_rate = float(data.get('fill_rate', 0.5))
-
-                # 记录挂单信息（用于日志）
-                pending_count = data.get('pending_orders', 0)
-                pending_timeout = data.get('pending_timeout_count', 0)
-                max_pending = data.get('max_pending_duration', 0.0)
+                pending_count = int(data.get('pending_count', data.get('pending_orders', 0)))
+                pending_timeout = int(data.get('pending_timeout_count', 0))
+                max_pending = float(data.get('max_pending_age', data.get('max_pending_duration', 0.0)))
 
                 if pending_timeout > 0:
                     logger.warning(
-                        f"⚠️ {server} has {pending_timeout} stuck orders (max age: {max_pending:.1f}s) | FillRate: {fill_rate*100:.0f}%"
+                        f"⚠️ {server} has {pending_timeout} stuck orders (max age: {max_pending:.1f}s) | Reported fill_rate={fill_rate*100:.0f}%"
                     )
 
-                return fill_rate
+                return {
+                    'fill_rate': fill_rate,
+                    'pending_count': pending_count,
+                    'max_pending_age': max_pending
+                }
         except Exception as e:
             logger.debug(f"Stats fetch failed for {server}: {e}")
             return None
 
     def _calculate_adaptive_multiplier(self, server: str, base_aggressive: bool) -> float:
         fill_rate = self._get_recent_fill_rate(server)
+        violation_rounds = self.limit_violation_rounds.get(server, 0)
+        fallback_threshold = max(0, SYSTEM_CONFIG.limit_fallback_count)
 
-        if fill_rate < 0.2:
-            multiplier = 0.01
+        if fill_rate < 0.05:
+            multiplier = 0.008  # 5%以下极度激进
+            logger.warning(
+                f"⚠️ {server} fill rate {fill_rate*100:.1f}% critical, using ultra-aggressive multiplier {multiplier}"
+            )
+        elif fill_rate < 0.1:
+            multiplier = 0.012  # 5-10%很激进
+            logger.warning(
+                f"⚠️ {server} fill rate {fill_rate*100:.1f}% extremely low, using multiplier {multiplier}"
+            )
+        elif fill_rate < 0.2:
+            multiplier = 0.02  # 10-20%用2%
             logger.warning(
                 f"⚠️ {server} fill rate {fill_rate*100:.1f}% very low, using multiplier {multiplier}"
             )
         elif fill_rate < 0.5:
-            multiplier = 0.02
+            multiplier = 0.03  # 20-50%用3%
         elif fill_rate > 0.8:
             multiplier = 0.05
             logger.info(
@@ -514,6 +871,17 @@ class CoordinatorBot:
             )
         else:
             multiplier = 0.03 if base_aggressive else 0.1
+
+        if base_aggressive and fallback_threshold > 0 and violation_rounds >= max(1, fallback_threshold - 1):
+            multiplier = min(multiplier, 0.005)
+            logger.warning(
+                "⚠️ %s close to taker fallback (round %d/%d), tightening maker offset",
+                server,
+                violation_rounds,
+                fallback_threshold
+            )
+        elif base_aggressive and violation_rounds > 0:
+            multiplier = min(multiplier, 0.015)
 
         return multiplier
 
@@ -551,19 +919,34 @@ class CoordinatorBot:
         orders_per_min_c = (self.stats_orders_sent['C'] / window_duration) * 60
         volume_per_hour = (self.stats_volume_generated / window_duration) * 3600
 
+        bucket_b = self.summary_metrics.get('B', {'fill_sum': 0.0, 'fill_count': 0, 'pending_max': 0.0})
+        bucket_c = self.summary_metrics.get('C', {'fill_sum': 0.0, 'fill_count': 0, 'pending_max': 0.0})
+        avg_fill_b = (bucket_b['fill_sum'] / bucket_b['fill_count']) if bucket_b['fill_count'] else self.executor_fill_rates.get('B', 0.5)
+        avg_fill_c = (bucket_c['fill_sum'] / bucket_c['fill_count']) if bucket_c['fill_count'] else self.executor_fill_rates.get('C', 0.5)
+        max_pending_b = bucket_b['pending_max']
+        max_pending_c = bucket_c['pending_max']
+
         logger.info(
-            "📊 [60s Summary] Orders: B=%d(%.1f/min) C=%d(%.1f/min) | Volume: $%.0f/h | FillRate: B=%.0f%% C=%.0f%%",
+            "📊 [60s Summary] Orders B=%d(%.1f/min) C=%d(%.1f/min) | Volume $%.0f/h | Fill(avg) B=%.0f%% C=%.0f%% | PendingMax B=%.1fs C=%.1fs | PendingCnt B=%d C=%d",
             self.stats_orders_sent['B'], orders_per_min_b,
             self.stats_orders_sent['C'], orders_per_min_c,
             volume_per_hour,
-            self.executor_fill_rates.get('B', 0.5) * 100,
-            self.executor_fill_rates.get('C', 0.5) * 100
+            avg_fill_b * 100,
+            avg_fill_c * 100,
+            max_pending_b,
+            max_pending_c,
+            self.executor_pending_orders.get('B', 0),
+            self.executor_pending_orders.get('C', 0)
         )
 
         # 重置统计窗口
         self.stats_window_start = current_time
         self.stats_orders_sent = {'B': 0, 'C': 0}
         self.stats_volume_generated = 0.0
+        for bucket in self.summary_metrics.values():
+            bucket['fill_sum'] = 0.0
+            bucket['fill_count'] = 0
+            bucket['pending_max'] = 0.0
 
     async def _async_init(self):
         """异步初始化 - 创建HTTP会话和客户端"""
@@ -643,10 +1026,10 @@ class CoordinatorBot:
                 await self._refresh_executor_stats()
 
                 # 3. 计算全局敞口
-                total_exposure, exposure_usd, _ = await self._calculate_total_exposure(market_data['mid_price'])
+                total_exposure, exposure_usd, exposure_btc = await self._calculate_total_exposure(market_data['mid_price'])
 
                 # 4. 做出交易决策
-                decisions = await self._make_trading_decisions(market_data, total_exposure, exposure_usd)
+                decisions = await self._make_trading_decisions(market_data, total_exposure, exposure_usd, exposure_btc)
 
                 # 5. 执行决策
                 await self._execute_decisions(decisions)
@@ -741,21 +1124,10 @@ class CoordinatorBot:
     async def _calculate_total_exposure(self, mid_price: float) -> Tuple[float, Dict[str, float], Dict[str, float]]:
         """计算全局敞口并返回各账户敞口 (USD 和 BTC)"""
         try:
-            # 获取自己的仓位
-            my_positions = await self.account_state.client.get_positions()
-            my_position_btc = 0.0
-
-            if my_positions:
-                for pos in my_positions:
-                    if pos.get('symbol') == SYMBOL:
-                        my_position_btc = float(pos.get('positionAmt', 0))
-                        break
-
             position_b = await self._fetch_executor_position('B')
             position_c = await self._fetch_executor_position('C')
 
             exposures_btc = {
-                'A': my_position_btc,
                 'B': position_b,
                 'C': position_c
             }
@@ -764,20 +1136,35 @@ class CoordinatorBot:
 
             total_exposure = sum(exposures_usd.values())
             self.executor_exposures = exposures_usd
+            self.executor_positions_btc = exposures_btc
             self.total_exposure = total_exposure
 
             # 计算仓位使用率
-            usage_a = abs(exposures_usd['A']) / self.position_limits['A'] if self.position_limits['A'] > 0 else 0
             usage_b = abs(exposures_usd['B']) / self.position_limits['B'] if self.position_limits['B'] > 0 else 0
             usage_c = abs(exposures_usd['C']) / self.position_limits['C'] if self.position_limits['C'] > 0 else 0
 
+            target_b = self.target_positions_btc.get('B', 0.0)
+            target_c = self.target_positions_btc.get('C', 0.0)
+            diff_b = exposures_btc['B'] - target_b
+            diff_c = exposures_btc['C'] - target_c
+
+            pending_b = self.executor_pending_orders.get('B', 0)
+            pending_c = self.executor_pending_orders.get('C', 0)
+            pending_age_b = self.executor_pending_max_age.get('B', 0.0)
+            pending_age_c = self.executor_pending_max_age.get('C', 0.0)
+
             # 简化日志：每次只显示关键信息
             logger.info(
-                "💰 Exposure | Net: $%.0f | A: $%.0f(%d%%) B: $%.0f(%d%%) C: $%.0f(%d%%) | FillRate B:%.0f%% C:%.0f%%",
+                "💰 Exposure | Net:$%.0f | B:$%.0f(%d%%) C:$%.0f(%d%%) | ΔB:%.4f ΔC:%.4f | Pending B:%d(%.1fs) C:%d(%.1fs) | FillRate B:%.0f%% C:%.0f%%",
                 total_exposure,
-                exposures_usd['A'], usage_a * 100,
                 exposures_usd['B'], usage_b * 100,
                 exposures_usd['C'], usage_c * 100,
+                diff_b,
+                diff_c,
+                pending_b,
+                pending_age_b,
+                pending_c,
+                pending_age_c,
                 self.executor_fill_rates.get('B', 0.5) * 100,
                 self.executor_fill_rates.get('C', 0.5) * 100
             )
@@ -785,28 +1172,67 @@ class CoordinatorBot:
 
         except Exception as e:
             logger.error(f"❌ Failed to calculate exposure: {e}")
-            fallback = {'A': 0.0, 'B': 0.0, 'C': 0.0}
+            fallback = {'B': 0.0, 'C': 0.0}
             return 0.0, fallback, fallback
 
     async def _make_trading_decisions(
         self,
         market_data: Dict,
         total_exposure: float,
-        exposures: Dict[str, float]
+        exposures_usd: Dict[str, float],
+        exposures_btc: Dict[str, float]
     ) -> List[Dict]:
         """制定交易决策"""
-        decisions = []
+        decisions: List[Dict] = []
         current_time = time.time()
+
+        exposures_usd_local = dict(exposures_usd)
+        exposures_btc_local = dict(exposures_btc)
+
+        # 决策数量限制：每轮最多2个决策
+        MAX_DECISIONS = 2
+
+        # ========== 优先级0: 净敞口硬限制（最高优先级，但允许并行） ==========
+        total_net_exposure = sum(exposures_usd_local.values())
+        emergency_triggered = False
+        if abs(total_net_exposure) > SYSTEM_CONFIG.net_exposure_hard_limit:
+            logger.warning(
+                f"🚨 Net exposure ${total_net_exposure:.0f} exceeds HARD LIMIT "
+                f"${SYSTEM_CONFIG.net_exposure_hard_limit:.0f}, triggering emergency balance"
+            )
+            self._append_emergency_net_exposure_correction(
+                decisions, market_data, exposures_usd_local, exposures_btc_local, total_net_exposure
+            )
+            emergency_triggered = True
+            # 不再直接return，允许后续逻辑并行执行（如果决策数未满）
 
         # 基于敞口和市场状况制定决策
         mid_price = market_data['mid_price']
         spread_bps = market_data['spread_bps']
 
-        limit_decisions = self._enforce_position_limits(market_data, exposures)
-        decisions.extend(limit_decisions)
+        # ========== 优先级1: 仓位限制纠偏 ==========
+        if len(decisions) < MAX_DECISIONS:
+            limit_decisions = self._enforce_position_limits(market_data, exposures_usd_local)
+            for correction in limit_decisions:
+                if len(decisions) >= MAX_DECISIONS:
+                    break
+                decisions.append(correction)
+                self._simulate_exposure_change(
+                    exposures_usd_local,
+                    exposures_btc_local,
+                    correction['server'],
+                    correction['action'],
+                    correction['price'],
+                    correction['quantity']
+                )
 
-        exposure_b = exposures.get('B', 0.0)
-        exposure_c = exposures.get('C', 0.0)
+        # ========== 优先级2: 目标仓位调节 ==========
+        # Emergency触发后跳过目标仓位调节，避免冲突
+        if not emergency_triggered and len(decisions) < MAX_DECISIONS:
+            self._ensure_target_inventory(decisions, market_data, exposures_usd_local, exposures_btc_local)
+
+        exposure_b = exposures_usd_local.get('B', 0.0)
+        exposure_c = exposures_usd_local.get('C', 0.0)
 
         # 敞口平衡逻辑
         exposure_threshold = self.config.per_server_max_notional * 0.5
@@ -821,6 +1247,7 @@ class CoordinatorBot:
 
             target = None
             for server, exposure in sell_candidates:
+                # 净敞口纠偏是最高优先级，不受pending限制
                 price = self._calculate_maker_price(market_data, 'SELL', aggressive=True, server=server)
                 quantity = self._normalize_quantity(base_qty)
                 order_notional = quantity * price
@@ -831,27 +1258,36 @@ class CoordinatorBot:
 
             if target:
                 target_server, price, quantity, order_notional = target
+                action = 'sell_maker'
                 logger.debug(
                     "Using %s to reduce long exposure: current %.2f, order %.2f, new %.2f, safe limit %.2f",
                     target_server,
-                    exposures.get(target_server, 0.0),
+                    exposures_usd_local.get(target_server, 0.0),
                     order_notional,
-                    exposures.get(target_server, 0.0) - order_notional,
-                    self.position_limits.get(target_server, 0.0) * 0.9
+                    exposures_usd_local.get(target_server, 0.0) - order_notional,
+                    self.position_limits.get(target_server, 0.0) * SAFETY_MARGIN
                 )
                 decisions.append({
                     'server': target_server,
-                    'action': 'sell_maker',
+                    'action': action,
                     'price': price,
                     'quantity': quantity,
                     'expire_time': current_time + self.config.signal_expire_seconds,
                     'reason': f'Reduce long exposure: ${total_exposure:.2f} via {target_server}'
                 })
+                self._simulate_exposure_change(
+                    exposures_usd_local,
+                    exposures_btc_local,
+                    target_server,
+                    action,
+                    price,
+                    quantity
+                )
             else:
                 logger.warning(
                     "⚠️ No eligible executor to reduce long exposure (order %.2f) without breaching limits; exposures=%s",
                     base_qty * mid_price,
-                    exposures
+                    exposures_usd_local
                 )
 
         elif total_exposure < -exposure_threshold:
@@ -864,6 +1300,7 @@ class CoordinatorBot:
 
             target = None
             for server, exposure in buy_candidates:
+                # 净敞口纠偏是最高优先级，不受pending限制
                 price = self._calculate_maker_price(market_data, 'BUY', aggressive=True, server=server)
                 quantity = self._normalize_quantity(base_qty)
                 order_notional = quantity * price
@@ -874,68 +1311,79 @@ class CoordinatorBot:
 
             if target:
                 target_server, price, quantity, order_notional = target
+                action = 'buy_maker'
                 logger.debug(
                     "Using %s to increase long exposure: current %.2f, order %.2f, new %.2f, safe limit %.2f",
                     target_server,
-                    exposures.get(target_server, 0.0),
+                    exposures_usd_local.get(target_server, 0.0),
                     order_notional,
-                    exposures.get(target_server, 0.0) + order_notional,
-                    self.position_limits.get(target_server, 0.0) * 0.9
+                    exposures_usd_local.get(target_server, 0.0) + order_notional,
+                    self.position_limits.get(target_server, 0.0) * SAFETY_MARGIN
                 )
                 decisions.append({
                     'server': target_server,
-                    'action': 'buy_maker',
+                    'action': action,
                     'price': price,
                     'quantity': quantity,
                     'expire_time': current_time + self.config.signal_expire_seconds,
                     'reason': f'Increase long exposure: ${total_exposure:.2f} via {target_server}'
                 })
+                self._simulate_exposure_change(
+                    exposures_usd_local,
+                    exposures_btc_local,
+                    target_server,
+                    action,
+                    price,
+                    quantity
+                )
             else:
                 logger.warning(
                     "⚠️ No eligible executor to increase long exposure (order %.2f) without breaching limits; exposures=%s",
                     base_qty * mid_price,
-                    exposures
+                    exposures_usd_local
                 )
 
-        # 积分优化逻辑 - 定期刷量
-        time_since_last_b = current_time - self.last_signal_time.get('B', 0)
-        time_since_last_c = current_time - self.last_signal_time.get('C', 0)
-
-        # 如果spread合适且长时间没有交易，主动制造交易量
-        if spread_bps < 5.0:
-            self._append_volume_decisions(decisions, market_data, exposures)
+        # ========== 优先级3: 刷量逻辑 ==========
+        # 仅在决策数未满时执行刷量
+        if spread_bps < 5.0 and len(decisions) < MAX_DECISIONS:
+            self._append_volume_decisions(
+                decisions,
+                market_data,
+                exposures_usd_local,
+                exposures_btc_local
+            )
 
         return decisions
 
     def _enforce_position_limits(self, market_data: Dict, exposures: Dict[str, float]) -> List[Dict]:
-        """检查并纠正各执行器仓位上限（激进策略）"""
+        """检查并纠正各执行器仓位上限（支持taker fallback）"""
         corrections: List[Dict] = []
         mid_price = market_data['mid_price']
+        fallback_threshold = max(0, SYSTEM_CONFIG.limit_fallback_count)
 
         for server in ('B', 'C'):
+            if self.executor_stats_blocked.get(server):
+                logger.debug("%s limit enforcement skipped due to pending backlog", server)
+                continue
+
             exposure = exposures.get(server, 0.0)
             raw_limit = self.position_limits.get(server, 0.0)
 
             if raw_limit is None or raw_limit <= 0:
                 continue
 
-            safe_limit = raw_limit * 0.9
+            safe_limit = raw_limit * SAFETY_MARGIN
 
             if abs(exposure) <= safe_limit:
-                # 仓位恢复正常，重置失败计数
                 self.limit_violation_rounds[server] = 0
                 continue
 
-            # 增加失败轮次
             self.limit_violation_rounds[server] += 1
             violation_rounds = self.limit_violation_rounds[server]
 
-            # 激进纠偏：平仓量 = 1.5倍超限部分（确保一次到位）
             over_usd = abs(exposure) - safe_limit
             order_notional = max(self.symbol_spec.min_notional, over_usd * 1.5)
-
-            # 但不能超过账户当前仓位的绝对值
-            order_notional = min(order_notional, abs(exposure) * 0.8)
+            order_notional = min(order_notional, max(abs(exposure) * 0.8, self.symbol_spec.min_notional))
 
             raw_qty = order_notional / mid_price if mid_price > 0 else 0.0
             quantity = self._normalize_quantity(raw_qty)
@@ -947,16 +1395,15 @@ class CoordinatorBot:
                 )
                 continue
 
-            # Taker fallback：连续3轮超限，改用taker强制平仓
-            use_taker = violation_rounds >= 3
+            use_taker = fallback_threshold > 0 and violation_rounds >= fallback_threshold
 
             if exposure > 0:
                 if use_taker:
                     action = 'sell_taker'
-                    price = mid_price  # taker使用市价
+                    price = mid_price
                     logger.error(
-                        "🚨🚨 %s TAKER FALLBACK (round %d): %.2f > %.2f, force selling %.6f BTC",
-                        server, violation_rounds, exposure, safe_limit, quantity
+                        "🚨🚨 %s TAKER FALLBACK (round %d/%d): %.2f > %.2f, force selling %.6f BTC",
+                        server, violation_rounds, fallback_threshold, exposure, safe_limit, quantity
                     )
                 else:
                     action = 'sell_maker'
@@ -971,8 +1418,8 @@ class CoordinatorBot:
                     action = 'buy_taker'
                     price = mid_price
                     logger.error(
-                        "🚨🚨 %s TAKER FALLBACK (round %d): %.2f < -%.2f, force buying %.6f BTC",
-                        server, violation_rounds, abs(exposure), safe_limit, quantity
+                        "🚨🚨 %s TAKER FALLBACK (round %d/%d): %.2f < -%.2f, force buying %.6f BTC",
+                        server, violation_rounds, fallback_threshold, abs(exposure), safe_limit, quantity
                     )
                 else:
                     action = 'buy_maker'
@@ -983,10 +1430,19 @@ class CoordinatorBot:
                 )
                 new_exposure = exposure + quantity * price
 
+            logger.warning(
+                "⚠️ %s exposure %.2f → %.2f / %.2f (USD)",
+                server,
+                exposure,
+                new_exposure,
+                safe_limit
+            )
+
             if not use_taker:
                 logger.error(
-                    "🚨 %s exposure %.2f exceeds safe limit %.2f; issuing %s of %.6f BTC (round %d/3)",
-                    server, exposure, safe_limit, action, quantity, violation_rounds
+                    "🚨 %s exposure %.2f exceeds safe limit %.2f; issuing %s of %.6f BTC (round %d/%d)",
+                    server, exposure, safe_limit, action, quantity,
+                    violation_rounds, max(1, fallback_threshold)
                 )
             logger.debug(
                 "Limit correction preview for %s: current %.2f -> %.2f (USD)",
@@ -1037,6 +1493,11 @@ class CoordinatorBot:
                     self.last_signal_time[server] = time.time()
                     self.stats_orders_sent[server] += 1
                     self.stats_volume_generated += quantity * price
+
+                    # 如果是刷量订单，更新轮换标志
+                    if 'Volume generation' in decision.get('reason', ''):
+                        self.last_volume_sender = server
+
                     side_emoji = "🔵" if 'buy' in decision['action'] else "🔴"
                     logger.info(
                         f"{side_emoji} {server} {decision['action']} | $%.0f @ %.1f | Reason: %s",
@@ -1047,6 +1508,7 @@ class CoordinatorBot:
                     logger.warning(f"⚠️ {server} signal failed")
 
             except Exception as e:
+                self._record_order_result(server, False)
                 logger.error(f"❌ Failed to execute decision: {e}")
 
     async def _send_signal_to_server(self, server: str, signal: Dict) -> bool:
