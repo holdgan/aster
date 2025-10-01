@@ -12,7 +12,7 @@ cd "$SCRIPT_DIR"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
+BLUE='\033[0;34m'   
 NC='\033[0m' # No Color
 
 # Default configuration
@@ -21,6 +21,7 @@ SERVER_B_URL="http://localhost:8081"
 SERVER_C_URL="http://localhost:8082"
 LOG_LEVEL="INFO"
 DRY_RUN=false
+STRATEGY="server"  # "server" or "cycle"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -45,6 +46,10 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN=true
             shift
             ;;
+        --strategy)
+            STRATEGY="$2"
+            shift 2
+            ;;
         -h|--help)
             echo "Usage: $0 [options]"
             echo "Options:"
@@ -52,6 +57,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --server-b URL      Server B endpoint"
             echo "  --server-c URL      Server C endpoint"
             echo "  --log-level LEVEL   Log level (DEBUG, INFO, WARNING, ERROR)"
+            echo "  --strategy TYPE     Strategy type: 'server' or 'cycle' (default: server)"
             echo "  --dry-run          Run without executing trades"
             echo "  -h, --help         Show this help message"
             exit 0
@@ -128,12 +134,27 @@ elif [[ ! -d "logs" ]]; then
     LOG_DIR="./logs"
 fi
 
+# Validate strategy selection
+if [[ "$STRATEGY" != "server" && "$STRATEGY" != "cycle" ]]; then
+    echo -e "${RED}❌ Error: Invalid strategy '$STRATEGY'. Must be 'server' or 'cycle'${NC}"
+    exit 1
+fi
+
+# Determine coordinator script based on strategy
+if [[ "$STRATEGY" == "cycle" ]]; then
+    COORDINATOR_SCRIPT="coordinator_cycle.py"
+    STRATEGY_NAME="Cyclic Inventory Maximizer"
+else
+    COORDINATOR_SCRIPT="coordinator_server.py"
+    STRATEGY_NAME="Target Position Strategy"
+fi
+
 # Pre-flight checks
 echo -e "${YELLOW}🔍 Running pre-flight checks...${NC}"
 
-# Check if coordinator_server.py exists (in current scripts directory)
-if [[ ! -f "coordinator_server.py" ]]; then
-    echo -e "${RED}❌ Error: coordinator_server.py not found${NC}"
+# Check if coordinator script exists
+if [[ ! -f "$COORDINATOR_SCRIPT" ]]; then
+    echo -e "${RED}❌ Error: $COORDINATOR_SCRIPT not found${NC}"
     exit 1
 fi
 
@@ -165,6 +186,8 @@ fi
 
 # Display configuration
 echo -e "${BLUE}📋 Configuration Summary:${NC}"
+echo "  Strategy: $STRATEGY_NAME ($STRATEGY)"
+echo "  Script: $COORDINATOR_SCRIPT"
 echo "  Account ID: $ACCOUNT_ID"
 echo "  Server B URL: $SERVER_B_URL"
 echo "  Server C URL: $SERVER_C_URL"
@@ -177,8 +200,13 @@ echo -e "${GREEN}🎯 Starting Aster Coordinator Server...${NC}"
 echo "Press Ctrl+C to stop"
 echo ""
 
-# Build command
-CMD="python3 coordinator_server.py --account $ACCOUNT_ID --server-b $SERVER_B_URL --server-c $SERVER_C_URL --log-level $LOG_LEVEL"
+# Build command based on strategy
+if [[ "$STRATEGY" == "cycle" ]]; then
+    # coordinator_cycle.py doesn't accept command line arguments, uses .env only
+    CMD="python3 $COORDINATOR_SCRIPT"
+else
+    CMD="python3 $COORDINATOR_SCRIPT --account $ACCOUNT_ID --server-b $SERVER_B_URL --server-c $SERVER_C_URL --log-level $LOG_LEVEL"
+fi
 
 if [[ "$DRY_RUN" == "true" ]]; then
     echo -e "${YELLOW}🧪 DRY RUN MODE - No actual trades will be executed${NC}"

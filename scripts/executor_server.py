@@ -42,10 +42,6 @@ except ImportError as e:
 load_dotenv()
 logger = get_logger("executor")
 
-# 读取基础配置（执行器仅做执行，风险由协调器负责）
-DEFAULT_MAX_ORDER_USD = os.getenv('MAX_ORDER_USD')
-DEFAULT_MAX_ORDER_USD = float(DEFAULT_MAX_ORDER_USD) if DEFAULT_MAX_ORDER_USD else None
-
 # 读取订单超时配置
 DEFAULT_ORDER_EXPIRY = float(os.getenv('ORDER_EXPIRY_TIME', '30.0'))
 DEFAULT_PENDING_FAILURE = float(os.getenv('PENDING_FAILURE_SECONDS', '20.0'))
@@ -59,7 +55,6 @@ class ExecutorConfig:
 
     # 风控参数
     max_position_usd: Optional[float] = None  # 仅用于监控日志，不阻断执行
-    max_order_usd: Optional[float] = field(default_factory=lambda: DEFAULT_MAX_ORDER_USD)
     max_orders_per_minute: int = 30
     order_expire_seconds: float = field(default_factory=lambda: DEFAULT_ORDER_EXPIRY)
     pending_failure_seconds: float = field(default_factory=lambda: DEFAULT_PENDING_FAILURE)
@@ -315,10 +310,7 @@ class ExecutorBot:
         if signal['action'] in ['buy_maker', 'sell_maker'] and signal['price'] <= 0:
             return {'valid': False, 'reason': 'Invalid price for maker order'}
 
-        # 检查订单大小
-        notional = signal['price'] * signal['quantity']
-        if self.config.max_order_usd and notional > self.config.max_order_usd:
-            return {'valid': False, 'reason': f'Order too large: ${notional:.2f}'}
+        # 订单大小由协调器控制，执行器不再检查
 
         # 检查频率限制
         current_minute = int(time.time() / 60)
@@ -834,7 +826,6 @@ async def main():
     parser.add_argument("--name", help="Server name for logging")
     parser.add_argument("--log-level", default="INFO", help="Log level")
     parser.add_argument("--max-position", type=float, default=None, help="Max position USD (optional)")
-    parser.add_argument("--max-order", type=float, default=None, help="Max order USD (optional)")
 
     args = parser.parse_args()
 
@@ -849,8 +840,6 @@ async def main():
     executor.config.listen_port = args.port
     if args.max_position is not None:
         executor.config.max_position_usd = args.max_position
-    if args.max_order is not None:
-        executor.config.max_order_usd = args.max_order
 
     # 异步初始化
     await executor._async_init()

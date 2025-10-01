@@ -51,7 +51,7 @@ class SystemConfig:
     """系统配置 - 统一管理所有配置参数"""
     max_position_b: float = 6000.0
     max_position_c: float = 6000.0
-    max_order_usd: float = 500.0
+    max_order_usd: float = 600.0
     order_size_usd: float = 226.0
     order_quantity_btc: float = 0.002  # 新增：直接指定BTC数量
     max_order_btc: float = 0.005
@@ -69,24 +69,12 @@ class SystemConfig:
 
     @classmethod
     def from_env(cls) -> 'SystemConfig':
-        """从环境变量安全加载配置"""
+        """从环境变量加载风控参数，其他参数使用硬编码默认值"""
         return cls(
+            # 风控参数 - 从 .env 读取
             max_position_b=cls._get_float('MAX_POSITION_B_USD', 6000.0),
             max_position_c=cls._get_float('MAX_POSITION_C_USD', 6000.0),
-            max_order_usd=cls._get_float('MAX_ORDER_USD', 500.0),
-            order_size_usd=cls._get_float('COORDINATOR_ORDER_SIZE_USD', 226.0),
-            order_quantity_btc=cls._get_float('COORDINATOR_ORDER_QUANTITY_BTC', 0.002),
-            max_order_btc=cls._get_float('COORDINATOR_MAX_ORDER_BTC', 0.005),
-            volume_cooldown=cls._get_float('VOLUME_COOLDOWN_SECONDS', 12.0),
-            target_position_btc_b=cls._get_float('TARGET_POSITION_BTC_B', 0.0),
-            target_position_btc_c=cls._get_float('TARGET_POSITION_BTC_C', 0.0),
-            target_position_threshold_btc=cls._get_float('TARGET_POSITION_THRESHOLD_BTC', 0.01),
-            limit_fallback_count=int(float(os.getenv('LIMIT_FALLBACK_COUNT', '3'))),
-            pending_count_threshold=int(float(os.getenv('PENDING_COUNT_THRESHOLD', '3'))),
-            pending_age_threshold_seconds=cls._get_float('PENDING_AGE_THRESHOLD_SECONDS', 12.0),
-            increase_position_usage_threshold=cls._get_float('INCREASE_POSITION_USAGE_THRESHOLD', 0.7),
-            net_exposure_soft_limit=cls._get_float('NET_EXPOSURE_SOFT_LIMIT', 50.0),
-            net_exposure_hard_limit=cls._get_float('NET_EXPOSURE_HARD_LIMIT', 200.0),
+            # 策略参数 - 使用类定义的默认值（硬编码）
         )
 
     @staticmethod
@@ -209,20 +197,20 @@ class ServerConfig:
 @dataclass
 class CoordinatorConfig:
     """协调器配置"""
-    # 服务器端点 - 从环境变量或命令行参数获取
+    # 服务器端点 - from .env (网络配置)
     server_b_url: str = ""
     server_c_url: str = ""
 
-    # 信号发送配置
+    # 信号发送配置 - 硬编码（策略配置）
     signal_timeout: float = 3.0
     signal_expire_seconds: float = 10.0
 
-    # 敞口控制
+    # 敞口控制 - 硬编码（策略配置，非风控）
     max_total_exposure_usd: float = 5000.0
     emergency_exposure_threshold: float = 8000.0
     per_server_max_notional: float = 1000.0
 
-    # 决策间隔
+    # 决策间隔 - 硬编码（策略配置）
     decision_interval: float = 2.0
     health_check_interval: float = 30.0
 
@@ -406,7 +394,22 @@ class CoordinatorBot:
     def _ensure_target_inventory(self, decisions: List[Dict], market_data: Dict,
                                  exposures_usd: Dict[str, float], exposures_btc: Dict[str, float]):
         mid_price = market_data['mid_price']
+
+        # 限制每轮最多调整1个server，避免同时建仓导致净敞口失控
+        adjusted_count = 0
+        max_adjustments_per_round = 1
+
         for server in ('B', 'C'):
+            # 检查本轮是否已有该server的决策（避免重复）
+            if any(d.get('server') == server for d in decisions):
+                logger.debug(f"{server} already has decision in this round, skip target adjust")
+                continue
+
+            # 检查是否已达到本轮调整上限
+            if adjusted_count >= max_adjustments_per_round:
+                logger.debug(f"Target adjustment limit reached ({adjusted_count}/{max_adjustments_per_round}), defer remaining")
+                break
+
             pending_count = self.executor_pending_orders.get(server, 0)
             max_pending_age = self.executor_pending_max_age.get(server, 0.0)
             count_threshold = SYSTEM_CONFIG.pending_count_threshold
@@ -432,8 +435,8 @@ class CoordinatorBot:
             safe_limit = raw_limit * SAFETY_MARGIN if raw_limit else 0.0
 
             side = 'SELL' if diff > 0 else 'BUY'
-            # 限制单次调整量：最多调整1/3的偏差，避免过度震荡
-            max_adjust_qty = abs(diff) * 0.33
+            # 限制单次调整量：最多调整1/4的偏差，避免订单过大触发executor限制
+            max_adjust_qty = abs(diff) * 0.25
             desired_qty = min(max_adjust_qty, SYSTEM_CONFIG.max_order_btc, safe_limit / mid_price * 0.3)
             quantity = self._normalize_quantity(desired_qty)
             if quantity < MIN_ORDER_QTY_BTC:
@@ -458,6 +461,7 @@ class CoordinatorBot:
             self._simulate_exposure_change(exposures_usd, exposures_btc, server,
                                            'sell_maker' if side == 'SELL' else 'buy_maker',
                                            price, quantity)
+            adjusted_count += 1  # 记录本轮已调整的server数量
 
     def _append_emergency_net_exposure_correction(
         self,
