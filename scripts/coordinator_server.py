@@ -28,8 +28,14 @@ from aster_btcusdt_genesis import (
     get_logger
 )
 
-# 常量
+# --- Trading Strategy Constants ------------------------------------------------
+# All strategy parameters are collected here for easy management
+
 SYMBOL = "BTCUSDT"
+
+# Position and risk parameters (仓位和风控参数)
+MAX_POSITION_B_USD = 5000.0  # Server B maximum position in USD
+MAX_POSITION_C_USD = 5000.0  # Server C maximum position in USD
 MAX_LEVERAGE = 10.0
 SAFETY_MARGIN = 0.95
 MIN_ORDER_QTY_BTC = 0.001
@@ -49,8 +55,8 @@ except ImportError as e:
 @dataclass
 class SystemConfig:
     """系统配置 - 统一管理所有配置参数"""
-    max_position_b: float = 6000.0
-    max_position_c: float = 6000.0
+    max_position_b: float = MAX_POSITION_B_USD
+    max_position_c: float = MAX_POSITION_C_USD
     max_order_usd: float = 600.0
     order_size_usd: float = 226.0
     order_quantity_btc: float = 0.002  # 新增：直接指定BTC数量
@@ -71,9 +77,6 @@ class SystemConfig:
     def from_env(cls) -> 'SystemConfig':
         """从环境变量加载风控参数，其他参数使用硬编码默认值"""
         return cls(
-            # 风控参数 - 从 .env 读取
-            max_position_b=cls._get_float('MAX_POSITION_B_USD', 6000.0),
-            max_position_c=cls._get_float('MAX_POSITION_C_USD', 6000.0),
             # 策略参数 - 使用类定义的默认值（硬编码）
         )
 

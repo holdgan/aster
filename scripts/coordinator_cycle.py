@@ -36,14 +36,19 @@ from aster_btcusdt_genesis import (  # type: ignore
     get_logger,
 )
 
-# --- constants -----------------------------------------------------------------
+# --- Trading Strategy Constants ------------------------------------------------
+# All strategy parameters are collected here for easy management
 
 SYMBOL = "BTCUSDT"
-MIN_ORDER_QTY_BTC = 0.001
+
+# Position and risk parameters (仓位和风控参数)
+MAX_POSITION_B_USD = 5000.0  # Server B maximum position in USD
+MAX_POSITION_C_USD = 5000.0  # Server C maximum position in USD
+MIN_ORDER_QTY_BTC = 0.001  # Minimum order quantity
 SAFETY_MARGIN = 0.85  # 85% of max position as target
-PHASE_TOLERANCE_USD = 100.0  # how close (USD) before we consider target reached
-NET_EXPOSURE_RATIO_LIMIT = 0.04  # 6% of combined max position
-MAKER_COOLDOWN_SECONDS = 2.0
+PHASE_TOLERANCE_USD = 100.0  # How close (USD) before we consider target reached
+NET_EXPOSURE_RATIO_LIMIT = 0.04  # 4% of combined max position
+MAKER_COOLDOWN_SECONDS = 2.0  # Cooldown between maker orders
 
 load_dotenv()
 logger = get_logger("coordinator-cycle")
@@ -55,14 +60,20 @@ class CycleConfig:
     server_b_url: str = os.getenv("SERVER_B_URL", "http://localhost:8081")
     server_c_url: str = os.getenv("SERVER_C_URL", "http://localhost:8082")
 
-    # Risk limits - from .env (风控参数)
-    max_position_b_usd: float = float(os.getenv("MAX_POSITION_B_USD", "6000"))
-    max_position_c_usd: float = float(os.getenv("MAX_POSITION_C_USD", "6000"))
-
     # Strategy parameters - hardcoded in file (策略配置)
     maker_step_btc: float = 0.002  # BTC per order
-    decision_interval: float = 2.0  # seconds between iterations
+    decision_interval: float = 5.0  # seconds between iterations
     signal_timeout: float = 3.0  # HTTP timeout for signals
+
+    # Order timing parameters (订单时间参数)
+    taker_expire_seconds: float = 5.0  # Taker emergency orders
+    maker_expire_seconds: float = 30.0  # Maker normal adjustment
+    maker_overlimit_expire_seconds: float = 20.0  # Maker force reduction
+    signal_delay_min: float = 0.0  # Random delay before sending signal
+    signal_delay_max: float = 5.0  # Random delay before sending signal
+
+    # Maker order price offset (挂单价格偏移)
+    maker_price_offset: float = 0.1  # Buy at bid-offset, sell at ask+offset
 
     @classmethod
     def from_env(cls) -> "CycleConfig":
@@ -106,8 +117,8 @@ class InventoryCycler:
 
         self.server_urls = {"B": self.config.server_b_url, "C": self.config.server_c_url}
         self.position_limits = {
-            "B": self.config.max_position_b_usd,
-            "C": self.config.max_position_c_usd,
+            "B": MAX_POSITION_B_USD,
+            "C": MAX_POSITION_C_USD,
         }
         # phases per server: 'LONG' or 'SHORT' (complementary: B LONG = C SHORT)
         self.phases: Dict[str, str] = {"B": "LONG", "C": "SHORT"}
@@ -222,8 +233,8 @@ class InventoryCycler:
             self._flip_phases()
 
         for decision in decisions:
-            # Random delay 0-6 seconds before sending signal
-            delay = random.uniform(0, 6)
+            # Random delay before sending signal
+            delay = random.uniform(self.config.signal_delay_min, self.config.signal_delay_max)
             await asyncio.sleep(delay)
 
             await self._send_signal(decision)
@@ -276,7 +287,7 @@ class InventoryCycler:
             "action": action,
             "price": market["mid_price"],
             "quantity": quantity,
-            "expire_time": market["timestamp"] + 5.0,
+            "expire_time": market["timestamp"] + self.config.taker_expire_seconds,
             "reason": f"🚨 EMERGENCY net exposure balance ${net_exposure:.0f}",
         }
 
@@ -304,7 +315,7 @@ class InventoryCycler:
                 "action": "sell_maker" if side == "SELL" else "buy_maker",
                 "price": price,
                 "quantity": quantity,
-                "expire_time": market["timestamp"] + 20.0,
+                "expire_time": market["timestamp"] + self.config.maker_overlimit_expire_seconds,
                 "reason": f"🚨 Reduce over-limit position ${current_usd:.0f} > ${max_limit:.0f}",
             }
 
@@ -328,7 +339,7 @@ class InventoryCycler:
             "action": action,
             "price": price,
             "quantity": quantity,
-            "expire_time": market["timestamp"] + 10.0,
+            "expire_time": market["timestamp"] + self.config.maker_expire_seconds,
             "reason": f"Phase adjust toward {target_usd:+.0f} USD",
         }
 
@@ -435,10 +446,13 @@ class InventoryCycler:
     def _calculate_maker_price(self, market: Dict[str, float], side: str) -> float:
         """Calculate maker order price
 
-        买单：挂在当前买1价格（bid_price）
-        卖单：挂在当前卖1价格（ask_price）
+        买单：挂在买1价格 - offset（bid_price - offset）
+        卖单：挂在卖1价格 + offset（ask_price + offset）
         """
-        price = market["bid_price"] if side == "BUY" else market["ask_price"]
+        if side == "BUY":
+            price = market["bid_price"] - self.config.maker_price_offset
+        else:
+            price = market["ask_price"] + self.config.maker_price_offset
         return self.account_state.symbol_spec.round_price(price)
 
 
