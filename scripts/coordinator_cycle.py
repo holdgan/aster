@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from aster_btcusdt_genesis import (  # type: ignore
+from utils.trading_client import (
     AsterFuturesClient,
     TradingConfig,
     AccountConfig,

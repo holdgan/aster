@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # 使用现有的交易客户端和配置
-from aster_btcusdt_genesis import (
+from utils.trading_client import (
     AsterFuturesClient, TradingConfig, AccountConfig, AccountState, SymbolSpec,
     get_logger
 )
